@@ -22,10 +22,10 @@
 
 ## 免费双人联机
 
-- 直接入口：<https://bisoubisou0905.github.io/rooftop-leap-threejs/?mode=duel>
-- 两位玩家打开同一个双人入口后会自动匹配并倒计时，不需要注册账号。
-- 页面使用 PeerJS Cloud 完成免费信令，比赛状态通过 WebRTC 在两台设备之间点对点同步；GitHub Pages 只负责托管静态游戏，因此没有持续服务器费用。
-- 当前原型使用一个公共双人大厅，适合朋友间小规模测试。公共信令不提供服务等级保证；少数严格 NAT 或企业网络需要 TURN 中继时可能无法直连，界面会明确显示连接失败。
+- 双人入口：<https://bisoubisou0905.github.io/rooftop-leap-threejs/?mode=duel&room=quick-0905>
+- 两位玩家必须打开包含同一个 `room` 的链接；主页会显示房间号，并可一键复制完整邀请链接。
+- 联机状态通过免费的 MQTT over Secure WebSocket 测试中继同步，因此不同 Wi-Fi、蜂窝网络或严格 NAT 下也不依赖 WebRTC 直连，不需要注册账号。
+- 当前小规模原型使用 EMQX 公共测试 broker，GitHub Pages 只负责静态托管，没有持续服务器费用。公共 broker 不提供生产服务等级保证，请勿在房间号或游戏消息中放置个人信息；正式发布时应迁移到自有或托管 broker。
 
 ## 本地运行
 
