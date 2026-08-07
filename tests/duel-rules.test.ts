@@ -3,15 +3,39 @@ import test from "node:test";
 import {
   consumeDuelLife,
   duelWaterProgressAt,
+  duelWaterTimingAt,
   isPlayerCaughtByWater,
 } from "../app/duel-rules.ts";
 
-test("water floods the starting roof, then advances one roof every five seconds", () => {
+test("water gives a ten second grace period, then advances one roof every seven seconds", () => {
   assert.equal(duelWaterProgressAt(0, 18), -1);
-  assert.equal(duelWaterProgressAt(6, 18), 0);
-  assert.equal(duelWaterProgressAt(11, 18), 1);
-  assert.equal(duelWaterProgressAt(16, 18), 2);
+  assert.equal(duelWaterProgressAt(10, 18), 0);
+  assert.equal(duelWaterProgressAt(17, 18), 1);
+  assert.equal(duelWaterProgressAt(24, 18), 2);
   assert.equal(duelWaterProgressAt(200, 18), 18);
+});
+
+test("water timing reports the next advance and its readable phase", () => {
+  assert.deepEqual(duelWaterTimingAt(0, 18), {
+    progress: -1,
+    nextAdvanceIn: 10,
+    phaseProgress: 0,
+  });
+  assert.deepEqual(duelWaterTimingAt(7.5, 18), {
+    progress: -0.25,
+    nextAdvanceIn: 2.5,
+    phaseProgress: 0.75,
+  });
+  assert.deepEqual(duelWaterTimingAt(13.5, 18), {
+    progress: 0.5,
+    nextAdvanceIn: 3.5,
+    phaseProgress: 0.5,
+  });
+  assert.deepEqual(duelWaterTimingAt(200, 18), {
+    progress: 18,
+    nextAdvanceIn: 0,
+    phaseProgress: 1,
+  });
 });
 
 test("three misses consume all three lives", () => {
