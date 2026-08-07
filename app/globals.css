@@ -980,6 +980,61 @@ button {
   font-size: 8px;
 }
 
+.duel-room-entry {
+  position: absolute;
+  top: 29%;
+  right: 24px;
+  left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid rgba(131, 213, 215, 0.18);
+  border-radius: 18px;
+  background: rgba(4, 20, 31, 0.52);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.16);
+  pointer-events: auto;
+  backdrop-filter: blur(14px);
+  transition: opacity 180ms ease, transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.duel-room-entry > span {
+  color: rgba(116, 201, 199, 0.58);
+  font-size: 8px;
+  font-weight: 760;
+  letter-spacing: 0.16em;
+}
+
+.duel-room-entry > strong {
+  color: rgba(238, 248, 245, 0.9);
+  font-size: 13px;
+}
+
+.duel-room-entry > p {
+  margin: 0;
+  color: rgba(219, 238, 235, 0.5);
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.duel-room-entry > small {
+  color: rgba(219, 238, 235, 0.38);
+  font-size: 7px;
+  text-align: center;
+}
+
+.duel-room-entry button {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 177, 126, 0.24);
+  border-radius: 12px;
+  color: rgba(255, 226, 206, 0.9);
+  background: rgba(255, 119, 85, 0.12);
+  font-size: 10px;
+  font-weight: 760;
+  cursor: pointer;
+}
+
 .duel-lobby-status {
   position: absolute;
   top: 31%;
@@ -1167,6 +1222,11 @@ button {
   transform: translateX(-20px);
 }
 
+.lobby-hidden .duel-room-entry {
+  opacity: 0;
+  transform: translateY(18px) scale(0.97);
+}
+
 .lobby-hidden .mode-dock {
   opacity: 0;
   transform: translateY(130px);
@@ -1350,6 +1410,55 @@ button {
   box-shadow: 0 -4px 0 -1px rgba(108, 199, 204, 0.32);
 }
 
+.duel-lives {
+  position: absolute;
+  z-index: 6;
+  top: max(112px, calc(env(safe-area-inset-top) + 96px));
+  left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid rgba(227, 242, 239, 0.1);
+  border-radius: 12px;
+  color: rgba(222, 239, 236, 0.54);
+  background: rgba(4, 18, 29, 0.28);
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+}
+
+.duel-lives > div {
+  display: grid;
+  grid-template-columns: 24px auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.duel-lives span {
+  font-size: 7px;
+  font-weight: 740;
+}
+
+.duel-lives i {
+  display: flex;
+  gap: 4px;
+}
+
+.duel-lives b {
+  width: 7px;
+  height: 7px;
+  border: 1px solid rgba(255, 147, 111, 0.24);
+  border-radius: 50%;
+  background: rgba(255, 119, 85, 0.08);
+  transition: background 180ms ease, box-shadow 180ms ease;
+}
+
+.duel-lives b.life-active {
+  border-color: rgba(255, 152, 116, 0.62);
+  background: #ef7558;
+  box-shadow: 0 0 9px rgba(239, 117, 88, 0.42);
+}
+
 .duel-position-rail {
   position: absolute;
   z-index: 6;
@@ -1470,7 +1579,6 @@ button {
 }
 
 .duel-result button {
-  margin-top: 8px;
   padding: 9px 16px;
   border: 1px solid rgba(255, 189, 149, 0.24);
   border-radius: 999px;
@@ -1479,6 +1587,25 @@ button {
   font-size: 9px;
   font-weight: 740;
   cursor: pointer;
+}
+
+.duel-result button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.duel-result-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.duel-result .duel-exit-button {
+  border-color: rgba(207, 232, 229, 0.14);
+  color: rgba(210, 232, 229, 0.65);
+  background: rgba(207, 232, 229, 0.05);
 }
 
 .settings-header {

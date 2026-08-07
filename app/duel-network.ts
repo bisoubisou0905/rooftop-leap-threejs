@@ -1,6 +1,7 @@
 import { makeDuelMatchId, normalizeDuelRoom } from "./duel-room";
 
 export type DuelCharacter = "runner" | "heavy";
+export type DuelEliminationReason = "lives" | "water";
 
 export type DuelPose = {
   position: [number, number, number];
@@ -10,6 +11,9 @@ export type DuelPose = {
   step: number;
   elapsedMs: number;
   character: DuelCharacter;
+  lives: number;
+  eliminated: boolean;
+  eliminationReason: DuelEliminationReason | null;
 };
 
 type LobbyPacket = {
@@ -18,18 +22,27 @@ type LobbyPacket = {
   from: string;
   sentAt: number;
   character: DuelCharacter;
-  type: "hello" | "offer" | "accept" | "start";
+  type:
+    | "hello"
+    | "offer"
+    | "accept"
+    | "start"
+    | "rematch-ready"
+    | "restart"
+    | "restart-ack";
   target?: string;
   busy?: boolean;
   matchId?: string;
   delayMs?: number;
+  rematchId?: string;
 };
 
 type GamePayload =
   | { type: "character"; character: DuelCharacter }
   | { type: "pose"; pose: DuelPose }
   | { type: "bump"; id: string; velocity: [number, number, number] }
-  | { type: "finish"; elapsedMs: number };
+  | { type: "finish"; elapsedMs: number }
+  | { type: "eliminated"; reason: DuelEliminationReason };
 
 type GamePacket = {
   version: 3;
@@ -103,6 +116,8 @@ export type DuelNetworkCallbacks = {
   onPose(pose: DuelPose): void;
   onBump(velocity: [number, number, number]): void;
   onFinish(elapsedMs: number): void;
+  onElimination(reason: DuelEliminationReason): void;
+  onRematchReady(ready: boolean): void;
   onRemoteCharacter(character: DuelCharacter): void;
 };
 
@@ -110,6 +125,8 @@ export type DuelNetworkController = {
   sendPose(pose: DuelPose): void;
   sendBump(velocity: [number, number, number]): void;
   sendFinish(elapsedMs: number): void;
+  sendElimination(reason: DuelEliminationReason): void;
+  requestRematch(): void;
   destroy(): void;
 };
 
@@ -181,6 +198,14 @@ function isPose(value: unknown): value is DuelPose {
     Number.isFinite(pose.step) &&
     typeof pose.elapsedMs === "number" &&
     Number.isFinite(pose.elapsedMs) &&
+    typeof pose.lives === "number" &&
+    Number.isInteger(pose.lives) &&
+    pose.lives >= 0 &&
+    pose.lives <= 3 &&
+    typeof pose.eliminated === "boolean" &&
+    (pose.eliminationReason === null ||
+      pose.eliminationReason === "lives" ||
+      pose.eliminationReason === "water") &&
     isCharacter(pose.character) &&
     ["idle", "charging", "flying", "falling", "failed"].includes(
       String(pose.phase),
@@ -231,6 +256,10 @@ export async function createDuelNetwork(
   let lastOfferAt = 0;
   let lastPoseSentAt = 0;
   let startAt = 0;
+  let localRematchReady = false;
+  let remoteRematchReady = false;
+  let pendingRematchId: string | null = null;
+  let lastAppliedRematchId: string | null = null;
   const seenBumps = new Set<string>();
 
   const publish = (
@@ -275,6 +304,10 @@ export async function createDuelNetwork(
     remoteLastSeenAt = 0;
     lastOfferAt = 0;
     startAt = 0;
+    localRematchReady = false;
+    remoteRematchReady = false;
+    pendingRematchId = null;
+    lastAppliedRematchId = null;
     if (!destroyed) callbacks.onStatus(status);
   };
 
@@ -303,6 +336,7 @@ export async function createDuelNetwork(
       startAt = Date.now() + START_DELAY_MS;
       callbacks.onStatus("connected");
       callbacks.onStart(START_DELAY_MS, -1);
+      callbacks.onRematchReady(false);
       sendGamePacket({ type: "character", character }, true);
     }
     publishLobby({
@@ -329,7 +363,36 @@ export async function createDuelNetwork(
     matchStarted = true;
     callbacks.onStatus("connected");
     callbacks.onStart(Math.max(600, Math.min(5000, delayMs)), 1);
+    callbacks.onRematchReady(false);
     sendGamePacket({ type: "character", character }, true);
+  };
+
+  const startRematchIfReady = () => {
+    if (
+      !localRematchReady ||
+      !remoteRematchReady ||
+      !remoteId ||
+      localId > remoteId
+    ) return;
+    const rematchId = `${localId}-${Date.now()}`;
+    const rematchStartsAt = Date.now() + START_DELAY_MS;
+    pendingRematchId = rematchId;
+    [0, 320, 780].forEach((retryDelay) => {
+      window.setTimeout(() => {
+        if (pendingRematchId !== rematchId) return;
+        publishLobby({
+          type: "restart",
+          target: remoteId,
+          matchId: matchId ?? undefined,
+          delayMs: Math.max(600, rematchStartsAt - Date.now()),
+          rematchId,
+        }, true);
+      }, retryDelay);
+    });
+    localRematchReady = false;
+    remoteRematchReady = false;
+    callbacks.onRematchReady(false);
+    callbacks.onStart(START_DELAY_MS, -1);
   };
 
   const handleLobbyPacket = (packet: Partial<LobbyPacket>) => {
@@ -388,6 +451,44 @@ export async function createDuelNetwork(
       (!remoteId || remoteId === packet.from)
     ) {
       startGuestMatch(packet.from, packet.character, packet.matchId, packet.delayMs);
+      return;
+    }
+
+    if (
+      packet.matchId !== matchId ||
+      !remoteId ||
+      packet.from !== remoteId
+    ) return;
+
+    if (packet.type === "rematch-ready") {
+      remoteRematchReady = true;
+      callbacks.onRematchReady(true);
+      startRematchIfReady();
+    } else if (
+      packet.type === "restart" &&
+      typeof packet.delayMs === "number" &&
+      Number.isFinite(packet.delayMs) &&
+      typeof packet.rematchId === "string" &&
+      localId > remoteId
+    ) {
+      publishLobby({
+        type: "restart-ack",
+        target: remoteId,
+        matchId,
+        rematchId: packet.rematchId,
+      }, true);
+      if (lastAppliedRematchId === packet.rematchId) return;
+      lastAppliedRematchId = packet.rematchId;
+      localRematchReady = false;
+      remoteRematchReady = false;
+      callbacks.onRematchReady(false);
+      callbacks.onStart(Math.max(600, Math.min(5000, packet.delayMs)), 1);
+    } else if (
+      packet.type === "restart-ack" &&
+      typeof packet.rematchId === "string" &&
+      packet.rematchId === pendingRematchId
+    ) {
+      pendingRematchId = null;
     }
   };
 
@@ -423,6 +524,11 @@ export async function createDuelNetwork(
       Number.isFinite(packet.elapsedMs)
     ) {
       callbacks.onFinish(Math.max(0, packet.elapsedMs));
+    } else if (
+      packet.type === "eliminated" &&
+      (packet.reason === "lives" || packet.reason === "water")
+    ) {
+      callbacks.onElimination(packet.reason);
     }
   };
 
@@ -459,7 +565,15 @@ export async function createDuelNetwork(
   });
 
   const heartbeatTimer = window.setInterval(() => {
-    if (client.connected) publishHello();
+    if (!client.connected) return;
+    publishHello();
+    if (localRematchReady && remoteId && matchId) {
+      publishLobby({
+        type: "rematch-ready",
+        target: remoteId,
+        matchId,
+      }, true);
+    }
   }, HEARTBEAT_MS);
   const watchdogTimer = window.setInterval(() => {
     if (
@@ -489,6 +603,19 @@ export async function createDuelNetwork(
     },
     sendFinish(elapsedMs) {
       sendGamePacket({ type: "finish", elapsedMs }, true);
+    },
+    sendElimination(reason) {
+      sendGamePacket({ type: "eliminated", reason }, true);
+    },
+    requestRematch() {
+      if (localRematchReady || !matchStarted || !remoteId) return;
+      localRematchReady = true;
+      publishLobby({
+        type: "rematch-ready",
+        target: remoteId,
+        matchId: matchId ?? undefined,
+      }, true);
+      startRematchIfReady();
     },
     destroy() {
       destroyed = true;

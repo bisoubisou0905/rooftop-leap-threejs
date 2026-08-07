@@ -76,8 +76,8 @@ export function dragDistanceToCharge(distance: number) {
 export function resolveWeightedPlayerCollision(
   local: PlayerCollisionBody,
   remote: PlayerCollisionBody,
-  restitution = 0.08,
-  maxVelocityChange = 0.72,
+  restitution = 0.12,
+  maxVelocityChange = 0.82,
 ): PlayerCollisionResult | null {
   const deltaX = local.x - remote.x;
   const deltaZ = local.z - remote.z;
@@ -113,7 +113,7 @@ export function resolveWeightedPlayerCollision(
   const remoteVelocityChange = impulse * inverseRemoteMass;
 
   const overlap = minimumDistance - distance;
-  const correction = Math.min(0.09, Math.max(0, overlap - 0.006) * 0.56);
+  const correction = Math.min(0.1, Math.max(0, overlap - 0.006) * 0.6);
   const localCorrection = correction * (inverseLocalMass / inverseMassTotal);
   const remoteCorrection = correction * (inverseRemoteMass / inverseMassTotal);
 

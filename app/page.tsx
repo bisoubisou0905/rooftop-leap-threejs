@@ -15,8 +15,16 @@ import {
   type VerticalCollisionProfile,
 } from "./game-physics";
 import { normalizeDuelRoom } from "./duel-room";
+import {
+  consumeDuelLife,
+  DUEL_STARTING_LIVES,
+  DUEL_WATER_START_LEVEL,
+  duelWaterProgressAt,
+  isPlayerCaughtByWater,
+} from "./duel-rules";
 import type {
   DuelCharacter,
+  DuelEliminationReason,
   DuelNetworkController,
   DuelNetworkStatus,
   DuelPose,
@@ -29,15 +37,6 @@ type AppScreen = "home" | "game" | "settings" | "characters";
 type BackgroundTheme = "night" | "dawn" | "violet" | "teal";
 type GameMode = "solo" | "duel";
 type CharacterType = DuelCharacter;
-
-type Hazard = {
-  step: number;
-  group: THREE.Group;
-  pivot: THREE.Group;
-  radius: number;
-  speed: number;
-  hitCooldown: number;
-};
 
 type Platform = {
   id: number;
@@ -888,61 +887,6 @@ function createPlatform(
   } satisfies Platform;
 }
 
-function createDuelHazard(
-  platform: Platform,
-  scene: THREE.Scene,
-  gradientMap: THREE.Texture,
-): Hazard {
-  const group = new THREE.Group();
-  group.position.set(platform.x, platform.topY, platform.z);
-  const pivot = new THREE.Group();
-  pivot.position.y = 0.24;
-  group.add(pivot);
-
-  const dark = new THREE.MeshToonMaterial({ color: 0x183348, gradientMap });
-  const warning = new THREE.MeshToonMaterial({
-    color: 0xff7755,
-    emissive: 0x8f241b,
-    emissiveIntensity: 0.18,
-    gradientMap,
-  });
-  const hub = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.095, 0.12, 0.4, 10),
-    dark,
-  );
-  hub.position.y = 0.02;
-  pivot.add(hub);
-
-  const radius = Math.min(platform.width, platform.depth) * 0.39;
-  const bar = new THREE.Mesh(
-    createRoundedBoxGeometry(radius * 2, 0.105, 0.11, 2, 0.035),
-    warning,
-  );
-  bar.position.y = 0.04;
-  pivot.add(bar);
-  [-1, 1].forEach((side) => {
-    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.085, 10, 8), warning);
-    cap.position.set(side * radius, 0.04, 0);
-    pivot.add(cap);
-  });
-
-  const base = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.19, 0.24, 0.1, 10),
-    dark,
-  );
-  base.position.y = 0.025;
-  group.add(base);
-  scene.add(group);
-  return {
-    step: platform.step,
-    group,
-    pivot,
-    radius,
-    speed: 0.64 + (platform.step % 3) * 0.12,
-    hitCooldown: 0,
-  };
-}
-
 function addDuelFinishGate(platform: Platform, gradientMap: THREE.Texture) {
   const gate = new THREE.Group();
   gate.name = "duel-finish-gate";
@@ -1234,6 +1178,7 @@ function pointOnPlatform(platform: Platform, x: number, z: number, margin = 0) {
 export default function Home() {
   const mountRef = useRef<HTMLDivElement>(null);
   const restartRef = useRef<() => void>(() => undefined);
+  const duelNetworkRef = useRef<DuelNetworkController | null>(null);
   const soundRef = useRef(true);
   const screenRef = useRef<AppScreen>("home");
   const modeRef = useRef<GameMode>("solo");
@@ -1259,16 +1204,28 @@ export default function Home() {
       ? "heavy"
       : "runner";
   });
-  const [duelRoom] = useState(() => {
+  const [duelRoom, setDuelRoom] = useState(() => {
     if (typeof window === "undefined") return normalizeDuelRoom(null);
     return normalizeDuelRoom(new URLSearchParams(window.location.search).get("room"));
   });
+  const [duelLobbyJoined, setDuelLobbyJoined] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const search = new URLSearchParams(window.location.search);
+    return search.get("mode") === "duel" && Boolean(search.get("room"));
+  });
   const [duelStatus, setDuelStatus] = useState<DuelNetworkStatus | "idle">("idle");
   const [duelInviteCopied, setDuelInviteCopied] = useState(false);
+  const [duelRematchWaiting, setDuelRematchWaiting] = useState(false);
+  const [duelRemoteRematchReady, setDuelRemoteRematchReady] = useState(false);
   const [duelCountdown, setDuelCountdown] = useState(0);
   const [duelElapsedMs, setDuelElapsedMs] = useState(0);
   const [duelProgress, setDuelProgress] = useState({ local: 0, remote: 0 });
+  const [duelLives, setDuelLives] = useState({
+    local: DUEL_STARTING_LIVES,
+    remote: DUEL_STARTING_LIVES,
+  });
   const [duelWaterGap, setDuelWaterGap] = useState(3);
+  const [duelWaterStep, setDuelWaterStep] = useState(0);
   const [duelResult, setDuelResult] = useState("");
   const [backgroundTheme, setBackgroundTheme] =
     useState<BackgroundTheme>(() => {
@@ -1300,6 +1257,7 @@ export default function Home() {
       window.history.replaceState(null, "", url);
       modeRef.current = "solo";
       setGameMode("solo");
+      setDuelLobbyJoined(false);
     }
     screenRef.current = "home";
     setScreen("home");
@@ -1336,7 +1294,8 @@ export default function Home() {
     const url = new URL(window.location.href);
     if (mode === "duel") {
       url.searchParams.set("mode", "duel");
-      url.searchParams.set("room", duelRoom);
+      url.searchParams.delete("room");
+      setDuelLobbyJoined(false);
     } else {
       url.searchParams.delete("mode");
       url.searchParams.delete("room");
@@ -1348,16 +1307,31 @@ export default function Home() {
     setDuelCountdown(0);
     setDuelElapsedMs(0);
     setDuelProgress({ local: 0, remote: 0 });
+    setDuelLives({ local: DUEL_STARTING_LIVES, remote: DUEL_STARTING_LIVES });
     setDuelWaterGap(3);
+    setDuelWaterStep(0);
     setDuelResult("");
+    setDuelRematchWaiting(false);
+    setDuelRemoteRematchReady(false);
     screenRef.current = "home";
     setScreen("home");
-  }, [duelRoom]);
+  }, []);
 
-  const copyDuelInvite = useCallback(async () => {
+  const enterDuelRoom = useCallback((roomValue: string) => {
+    const room = normalizeDuelRoom(roomValue);
     const url = new URL(window.location.href);
     url.searchParams.set("mode", "duel");
-    url.searchParams.set("room", duelRoom);
+    url.searchParams.set("room", room);
+    window.history.replaceState(null, "", url);
+    setDuelRoom(room);
+    setDuelStatus("loading");
+    setDuelLobbyJoined(true);
+  }, []);
+
+  const writeDuelInvite = useCallback(async (room: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("mode", "duel");
+    url.searchParams.set("room", room);
     try {
       await navigator.clipboard.writeText(url.toString());
     } catch {
@@ -1372,7 +1346,26 @@ export default function Home() {
     }
     setDuelInviteCopied(true);
     window.setTimeout(() => setDuelInviteCopied(false), 1800);
-  }, [duelRoom]);
+  }, []);
+
+  const createDuelRoom = useCallback(async () => {
+    const random = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replace(/-/g, "").slice(0, 6)
+      : Math.random().toString(36).slice(2, 8);
+    const room = `roof-${random}`;
+    enterDuelRoom(room);
+    await writeDuelInvite(room);
+  }, [enterDuelRoom, writeDuelInvite]);
+
+  const copyDuelInvite = useCallback(async () => {
+    await writeDuelInvite(duelRoom);
+  }, [duelRoom, writeDuelInvite]);
+
+  const requestDuelRematch = useCallback(() => {
+    if (!duelNetworkRef.current || duelRematchWaiting) return;
+    setDuelRematchWaiting(true);
+    duelNetworkRef.current.requestRematch();
+  }, [duelRematchWaiting]);
 
   const retry = useCallback(() => {
     restartRef.current();
@@ -1422,18 +1415,24 @@ export default function Home() {
     let fallImpactReaction = 0;
     const fallImpactNormal = new THREE.Vector2();
     const duelFinishStep = 18;
-    let hazards: Hazard[] = [];
     let duelNetwork: DuelNetworkController | null = null;
     let duelConnected = false;
     let duelRaceStartAt = Number.POSITIVE_INFINITY;
+    let duelOutcomeArmedAt = Number.POSITIVE_INFINITY;
     let duelRaceActive = false;
     let duelFinishedAt: number | null = null;
     let remoteFinishedAt: number | null = null;
+    let duelMatchEnded = false;
+    let localEliminated = false;
+    let remoteEliminated = false;
+    let localEliminationReason: DuelEliminationReason | null = null;
+    let localLives = DUEL_STARTING_LIVES;
+    let remoteLives = DUEL_STARTING_LIVES;
     let duelPenaltyMs = 0;
-    let duelWaterLevel = -3;
+    let duelWaterLevel = DUEL_WATER_START_LEVEL;
+    let duelWaterFrozenElapsed: number | null = null;
     let lastDuelUiUpdate = 0;
     let playerCollisionCooldown = 0;
-    let waterCatchCooldown = 0;
     let remoteCharacter: CharacterType = "heavy";
     let remoteStep = 0;
     let remotePoseReceived = false;
@@ -1961,13 +1960,6 @@ export default function Home() {
     };
 
     const removePlatform = (platform: Platform) => {
-      hazards
-        .filter((hazard) => hazard.step === platform.step)
-        .forEach((hazard) => {
-          scene.remove(hazard.group);
-          disposeObject(hazard.group);
-        });
-      hazards = hazards.filter((hazard) => hazard.step !== platform.step);
       scene.remove(platform.group);
       disposeObject(platform.group);
       platforms = platforms.filter((item) => item !== platform);
@@ -1987,18 +1979,6 @@ export default function Home() {
         const nextStep = generatedThroughStep + 1;
         const nextRow = makeRouteRow(generatedRow, nextStep);
         platforms.push(...nextRow);
-        if (
-          gameMode === "duel" &&
-          [5, 10, 15].includes(nextStep) &&
-          !hazards.some((hazard) => hazard.step === nextStep)
-        ) {
-          const hazardPlatform = [...nextRow]
-            .filter((platform) => platform.kind === "roof")
-            .sort((a, b) => b.width * b.depth - a.width * a.depth)[0];
-          if (hazardPlatform) {
-            hazards.push(createDuelHazard(hazardPlatform, scene, toonGradient));
-          }
-        }
         if (gameMode === "duel" && nextStep === duelFinishStep) {
           const finishPlatform = [...nextRow]
             .filter((platform) => platform.kind === "roof")
@@ -2120,11 +2100,6 @@ export default function Home() {
     };
 
     const resetPlatforms = () => {
-      hazards.forEach((hazard) => {
-        scene.remove(hazard.group);
-        disposeObject(hazard.group);
-      });
-      hazards = [];
       platforms.forEach((platform) => {
         scene.remove(platform.group);
         disposeObject(platform.group);
@@ -2182,12 +2157,24 @@ export default function Home() {
       fallImpactNormal.set(0, 0);
       duelFinishedAt = null;
       remoteFinishedAt = null;
+      duelMatchEnded = false;
+      localEliminated = false;
+      remoteEliminated = false;
+      localEliminationReason = null;
+      localLives = DUEL_STARTING_LIVES;
+      remoteLives = DUEL_STARTING_LIVES;
       duelPenaltyMs = 0;
+      duelWaterLevel = DUEL_WATER_START_LEVEL;
+      duelWaterFrozenElapsed = null;
       duelRaceActive = false;
+      duelOutcomeArmedAt = Number.POSITIVE_INFINITY;
       remoteStep = 0;
+      remotePoseReceived = false;
       setDuelElapsedMs(0);
       setDuelProgress({ local: 0, remote: 0 });
+      setDuelLives({ local: DUEL_STARTING_LIVES, remote: DUEL_STARTING_LIVES });
       setDuelWaterGap(3);
+      setDuelWaterStep(0);
       setDuelResult("");
       chargeMaterial.opacity = 0;
       tensionLines.visible = false;
@@ -2198,8 +2185,65 @@ export default function Home() {
     };
     restartRef.current = restart;
 
+    const endDuelByElimination = (
+      loser: "local" | "remote",
+      reason: DuelEliminationReason,
+    ) => {
+      if (loser === "local") {
+        if (localEliminated) return;
+        localEliminated = true;
+        localEliminationReason = reason;
+        localLives = 0;
+        setDuelLives((current) => ({ ...current, local: 0 }));
+        setInternalPhase("failed");
+        duelNetwork?.sendElimination(reason);
+        window.setTimeout(() => {
+          if (!destroyed && localEliminated) runner.visible = false;
+        }, 320);
+      } else {
+        if (remoteEliminated) return;
+        remoteEliminated = true;
+        remoteLives = 0;
+        remotePhase = "failed";
+        setDuelLives((current) => ({ ...current, remote: 0 }));
+      }
+
+      duelRaceActive = false;
+      setDuelCountdown(0);
+      const stoppedAt = Number.isFinite(duelRaceStartAt)
+        ? Math.max(0, performance.now() - duelRaceStartAt + duelPenaltyMs)
+        : 0;
+      duelWaterFrozenElapsed = Number.isFinite(duelRaceStartAt)
+        ? Math.max(0, performance.now() - duelRaceStartAt) / 1000
+        : 0;
+      setDuelElapsedMs(stoppedAt);
+
+      if (localEliminated && remoteEliminated) {
+        duelMatchEnded = true;
+        setDuelResult("双方同时出局");
+        flashNotice("双方出局");
+        return;
+      }
+      if (duelMatchEnded) return;
+      duelMatchEnded = true;
+      const waterReason = reason === "water" ? "被水追上" : "三次失误";
+      if (loser === "local") {
+        setDuelResult(`${waterReason} · 对手获胜`);
+        flashNotice("你已出局");
+      } else {
+        setDuelResult(`对手${waterReason} · 你获胜`);
+        flashNotice("对手出局");
+      }
+    };
+
     const respawnDuel = () => {
-      if (destroyed || gameMode !== "duel" || duelFinishedAt !== null) return;
+      if (
+        destroyed ||
+        gameMode !== "duel" ||
+        duelFinishedAt !== null ||
+        duelMatchEnded ||
+        localEliminated
+      ) return;
       runner.position.set(
         currentPlatform.x,
         currentPlatform.topY + RUNNER_GROUND_OFFSET,
@@ -2211,9 +2255,8 @@ export default function Home() {
       settleGroundedPose();
       captureFootFrame(previousFootFrame);
       duelPenaltyMs += 1200;
-      waterCatchCooldown = 1.4;
       setInternalPhase("idle");
-      flashNotice("回到上一个落点 · +1.2秒");
+      flashNotice(`回到上一个落点 · 还剩 ${localLives} 命`);
     };
 
     const fail = () => {
@@ -2225,7 +2268,14 @@ export default function Home() {
       playSound("fail");
       if (navigator.vibrate) navigator.vibrate([35, 40, 80]);
       if (gameMode === "duel") {
-        window.setTimeout(respawnDuel, 760);
+        const lifeLoss = consumeDuelLife(localLives);
+        localLives = lifeLoss.lives;
+        setDuelLives((current) => ({ ...current, local: localLives }));
+        if (lifeLoss.eliminated) {
+          endDuelByElimination("local", "lives");
+        } else {
+          window.setTimeout(respawnDuel, 760);
+        }
       }
     };
 
@@ -2356,7 +2406,8 @@ export default function Home() {
       if (
         gameMode === "duel" &&
         platform.step >= duelFinishStep &&
-        duelFinishedAt === null
+        duelFinishedAt === null &&
+        !duelMatchEnded
       ) {
         duelFinishedAt = Math.max(
           0,
@@ -2493,7 +2544,9 @@ export default function Home() {
       if (gameMode === "duel" && (
         !duelConnected ||
         !duelRaceActive ||
-        duelFinishedAt !== null
+        duelFinishedAt !== null ||
+        duelMatchEnded ||
+        localEliminated
       )) {
         flashNotice(duelConnected ? "等待倒计时" : "正在寻找对手");
         return;
@@ -2565,7 +2618,7 @@ export default function Home() {
     );
     captureFootFrame(previousFootFrame);
 
-    if (gameMode === "duel") {
+    if (gameMode === "duel" && duelLobbyJoined) {
       risingWater.group.visible = true;
       void import("./duel-network")
         .then(({ createDuelNetwork }) => createDuelNetwork(selectedCharacter, duelRoom, {
@@ -2577,10 +2630,13 @@ export default function Home() {
           onStart(delayMs, lane) {
             if (destroyed) return;
             restart();
+            setDuelRematchWaiting(false);
+            setDuelRemoteRematchReady(false);
             runner.position.x = currentPlatform.x + lane * 0.36;
             captureFootFrame(previousFootFrame);
             duelConnected = true;
             duelRaceStartAt = performance.now() + delayMs;
+            duelOutcomeArmedAt = duelRaceStartAt + 750;
             duelRaceActive = false;
             setDuelCountdown(Math.ceil(delayMs / 1000));
             screenRef.current = "game";
@@ -2588,31 +2644,48 @@ export default function Home() {
           },
           onPose(pose: DuelPose) {
             if (destroyed) return;
+            if (pose.eliminated && performance.now() < duelOutcomeArmedAt) return;
             remoteTargetPosition.fromArray(pose.position);
             remoteVelocity.fromArray(pose.velocity);
             remoteRotationY = pose.rotationY;
             remotePhase = pose.phase;
             remoteStep = clamp(Math.round(pose.step), 0, duelFinishStep);
             remoteCharacter = pose.character;
+            remoteLives = clamp(Math.round(pose.lives), 0, DUEL_STARTING_LIVES);
+            setDuelLives((current) => ({ ...current, remote: remoteLives }));
             remotePoseReceived = true;
             setDuelProgress((current) => ({ ...current, remote: remoteStep }));
+            if (pose.eliminated && pose.eliminationReason) {
+              endDuelByElimination("remote", pose.eliminationReason);
+            }
           },
           onBump(nextVelocity) {
-            if (destroyed || duelFinishedAt !== null) return;
+            if (destroyed || duelFinishedAt !== null || duelMatchEnded) return;
             const received = new THREE.Vector3().fromArray(nextVelocity);
-            const capped = Math.min(0.54, received.length());
+            const capped = Math.min(0.66, received.length());
             if (received.lengthSq() > 0.0001) received.setLength(capped);
             if (gamePhase === "flying" || gamePhase === "falling") {
               velocity.add(received);
             } else {
-              runner.position.addScaledVector(received, 0.07);
+              runner.position.addScaledVector(received, 0.09);
             }
-            cameraKick = Math.max(cameraKick, 0.08);
+            cameraKick = Math.max(cameraKick, 0.11);
+            runnerVisual.rotation.z = clamp(-received.x * 0.42, -0.22, 0.22);
+            playSound("scrape");
+            if (navigator.vibrate) navigator.vibrate(16);
           },
           onFinish(elapsedMs) {
-            if (destroyed) return;
+            if (destroyed || duelMatchEnded) return;
             remoteFinishedAt = elapsedMs;
             updateDuelResult();
+          },
+          onElimination(reason) {
+            if (!destroyed && performance.now() >= duelOutcomeArmedAt) {
+              endDuelByElimination("remote", reason);
+            }
+          },
+          onRematchReady(ready) {
+            if (!destroyed) setDuelRemoteRematchReady(ready);
           },
           onRemoteCharacter(character) {
             remoteCharacter = character;
@@ -2620,7 +2693,10 @@ export default function Home() {
         }))
         .then((controller) => {
           if (destroyed) controller.destroy();
-          else duelNetwork = controller;
+          else {
+            duelNetwork = controller;
+            duelNetworkRef.current = controller;
+          }
         })
         .catch(() => {
           if (!destroyed) setDuelStatus("error");
@@ -2820,12 +2896,12 @@ export default function Home() {
       if (gameMode === "duel") {
         const now = performance.now();
         playerCollisionCooldown = Math.max(0, playerCollisionCooldown - dt);
-        waterCatchCooldown = Math.max(0, waterCatchCooldown - dt);
 
         if (
           duelConnected &&
           !duelRaceActive &&
           duelFinishedAt === null &&
+          !duelMatchEnded &&
           Number.isFinite(duelRaceStartAt)
         ) {
           const remaining = duelRaceStartAt - now;
@@ -2841,14 +2917,47 @@ export default function Home() {
         const raceElapsed = Number.isFinite(duelRaceStartAt)
           ? Math.max(0, now - duelRaceStartAt + duelPenaltyMs)
           : 0;
+
+        const routeTopAtStep = (step: number) => {
+          const stepPlatforms = platforms.filter((platform) => platform.step === step);
+          return stepPlatforms.length > 0
+            ? Math.max(...stepPlatforms.map((platform) => platform.topY))
+            : currentPlatform.topY;
+        };
+        const waterElapsed = duelWaterFrozenElapsed ??
+          Math.max(0, now - duelRaceStartAt) / 1000;
+        const waterProgress = duelWaterProgressAt(waterElapsed, duelFinishStep);
+        let targetWaterLevel: number;
+        if (waterProgress < 0) {
+          targetWaterLevel = THREE.MathUtils.lerp(
+            DUEL_WATER_START_LEVEL,
+            routeTopAtStep(0) + 0.025,
+            waterProgress + 1,
+          );
+        } else {
+          const lowerStep = Math.floor(waterProgress);
+          const upperStep = Math.min(duelFinishStep, lowerStep + 1);
+          targetWaterLevel = THREE.MathUtils.lerp(
+            routeTopAtStep(lowerStep) + 0.025,
+            routeTopAtStep(upperStep) + 0.025,
+            waterProgress - lowerStep,
+          );
+        }
+        duelWaterLevel = THREE.MathUtils.damp(
+          duelWaterLevel,
+          targetWaterLevel,
+          5.2,
+          dt,
+        );
+
         if (now - lastDuelUiUpdate > 100) {
           lastDuelUiUpdate = now;
-          if (duelFinishedAt === null) setDuelElapsedMs(raceElapsed);
-          setDuelWaterGap(Math.max(0, currentPlatform.topY - duelWaterLevel));
+          if (duelFinishedAt === null && !duelMatchEnded) setDuelElapsedMs(raceElapsed);
+          const soleHeight = runner.position.y - RUNNER_GROUND_OFFSET;
+          setDuelWaterGap(Math.max(0, soleHeight - duelWaterLevel));
+          setDuelWaterStep(Math.floor(Math.max(0, waterProgress)));
         }
 
-        const waterElapsed = Math.max(0, now - duelRaceStartAt) / 1000;
-        duelWaterLevel = -3 + waterElapsed * 0.057;
         risingWater.group.position.set(focus.x, duelWaterLevel, focus.z);
         risingWater.waterMaterial.opacity = 0.14 + Math.sin(elapsed * 0.72) * 0.025;
         risingWater.ripples.forEach((ripple, index) => {
@@ -2857,57 +2966,22 @@ export default function Home() {
           (ripple.material as THREE.MeshBasicMaterial).opacity = (1 - cycle) * 0.12;
         });
 
-        hazards.forEach((hazard) => {
-          hazard.hitCooldown = Math.max(0, hazard.hitCooldown - dt);
-          hazard.pivot.rotation.y += hazard.speed * dt;
-          if (
-            !duelRaceActive ||
-            duelFinishedAt !== null ||
-            gamePhase === "failed" ||
-            hazard.hitCooldown > 0
-          ) return;
-          const platform = platforms.find((candidate) => candidate.step === hazard.step);
-          if (!platform || Math.abs(runner.position.y - platform.topY) > 0.86) return;
-          const offsetX = runner.position.x - hazard.group.position.x;
-          const offsetZ = runner.position.z - hazard.group.position.z;
-          const cosine = Math.cos(hazard.pivot.rotation.y);
-          const sine = Math.sin(hazard.pivot.rotation.y);
-          const along = Math.abs(offsetX * cosine + offsetZ * sine);
-          const perpendicular = -offsetX * sine + offsetZ * cosine;
-          const bodyRadius = Number(runner.userData.radius) || 0.28;
-          if (
-            along > hazard.radius + bodyRadius * 0.35 ||
-            Math.abs(perpendicular) > bodyRadius + 0.075
-          ) return;
-          const direction = Math.sign(perpendicular) || 1;
-          const mass = Number(runner.userData.mass) || 1;
-          const push = (selectedCharacter === "heavy" ? 0.22 : 0.3) / mass;
-          const pushX = -sine * direction * push;
-          const pushZ = cosine * direction * push;
-          if (gamePhase === "flying" || gamePhase === "falling") {
-            velocity.x += pushX;
-            velocity.z += pushZ;
-          } else {
-            runner.position.x += pushX * 0.13;
-            runner.position.z += pushZ * 0.13;
-            runnerVisual.rotation.z = -pushX * 0.34;
-          }
-          hazard.hitCooldown = 0.72;
-          cameraKick = Math.max(cameraKick, 0.1);
-          flashNotice("扫杆轻碰");
-          playSound("scrape");
-        });
-
         if (
           duelRaceActive &&
           duelFinishedAt === null &&
-          waterCatchCooldown <= 0 &&
+          !duelMatchEnded &&
+          !localEliminated &&
           gamePhase !== "failed" &&
-          currentPlatform.topY < duelWaterLevel + 0.08
+          isPlayerCaughtByWater(
+            runner.position.y - RUNNER_GROUND_OFFSET,
+            duelWaterLevel,
+          )
         ) {
-          waterCatchCooldown = 2;
-          flashNotice("水位追上来了");
-          fail();
+          cameraKick = Math.max(cameraKick, 0.22);
+          spawnMissParticles(currentPlatform, duelWaterLevel + 0.03);
+          playSound("fail");
+          if (navigator.vibrate) navigator.vibrate([55, 35, 100]);
+          endDuelByElimination("local", "water");
         }
 
         const visibleRemote = remoteRunners[remoteCharacter];
@@ -2943,6 +3017,9 @@ export default function Home() {
           if (
             duelRaceActive &&
             duelFinishedAt === null &&
+            !duelMatchEnded &&
+            !localEliminated &&
+            !remoteEliminated &&
             remotePhase !== "failed" &&
             verticalDistance < 0.72 &&
             playerCollisionCooldown <= 0
@@ -2980,10 +3057,12 @@ export default function Home() {
                 collision.remoteVelocityZ - remoteVelocity.z,
               ]);
               if (Math.hypot(localDeltaX, localDeltaZ) > 0.04) {
-                runnerVisual.rotation.z = clamp(-localDeltaX * 0.34, -0.18, 0.18);
-                cameraKick = Math.max(cameraKick, 0.07);
+                runnerVisual.rotation.z = clamp(-localDeltaX * 0.42, -0.23, 0.23);
+                cameraKick = Math.max(cameraKick, 0.1);
+                playSound("scrape");
+                if (navigator.vibrate) navigator.vibrate(14);
               }
-              playerCollisionCooldown = 0.16;
+              playerCollisionCooldown = 0.18;
             }
           }
         }
@@ -2997,6 +3076,9 @@ export default function Home() {
             step: currentPlatform.step,
             elapsedMs: duelFinishedAt ?? raceElapsed,
             character: selectedCharacter,
+            lives: localLives,
+            eliminated: localEliminated,
+            eliminationReason: localEliminationReason,
           });
         }
       }
@@ -3169,6 +3251,7 @@ export default function Home() {
     return () => {
       destroyed = true;
       duelNetwork?.destroy();
+      if (duelNetworkRef.current === duelNetwork) duelNetworkRef.current = null;
       window.cancelAnimationFrame(animationFrame);
       if (noticeTimer) window.clearTimeout(noticeTimer);
       resizeObserver.disconnect();
@@ -3187,7 +3270,7 @@ export default function Home() {
       if (audioContext) void audioContext.close();
       mount.removeChild(renderer.domElement);
     };
-  }, [duelRoom, gameMode, selectedCharacter]);
+  }, [duelLobbyJoined, duelRoom, gameMode, selectedCharacter]);
 
   const duelStatusLabel: Record<DuelNetworkStatus | "idle", string> = {
     idle: "未连接",
@@ -3282,7 +3365,29 @@ export default function Home() {
         {screen === "game" && gameMode === "duel" && (
           <div className="duel-water-chip" aria-label="水面距离">
             <span className="water-wave-icon" aria-hidden="true" />
-            <strong>{duelWaterGap < 0.65 ? "水位逼近" : `水面 ${duelWaterGap.toFixed(1)}m`}</strong>
+            <strong>
+              {duelWaterGap < 0.65
+                ? "水位逼近"
+                : `已淹 ${duelWaterStep}/18 · ${duelWaterGap.toFixed(1)}m`}
+            </strong>
+          </div>
+        )}
+
+        {screen === "game" && gameMode === "duel" && (
+          <div className="duel-lives" aria-label="双方剩余生命">
+            {(["local", "remote"] as const).map((side) => (
+              <div key={side}>
+                <span>{side === "local" ? "你" : "对手"}</span>
+                <i aria-hidden="true">
+                  {Array.from({ length: DUEL_STARTING_LIVES }, (_, index) => (
+                    <b
+                      key={index}
+                      className={index < duelLives[side] ? "life-active" : ""}
+                    />
+                  ))}
+                </i>
+              </div>
+            ))}
           </div>
         )}
 
@@ -3317,9 +3422,24 @@ export default function Home() {
 
         {screen === "game" && gameMode === "duel" && duelResult && (
           <div className="duel-result" role="status">
-            <span>计时赛</span>
+            <span>生存竞速</span>
             <strong>{duelResult}</strong>
-            <button type="button" onClick={returnHome}>返回主页</button>
+            <div className="duel-result-actions">
+              <button
+                type="button"
+                onClick={requestDuelRematch}
+                disabled={duelRematchWaiting}
+              >
+                {duelRematchWaiting
+                  ? "等待对手…"
+                  : duelRemoteRematchReady
+                    ? "对手已准备 · 再来一局"
+                    : "再来一局"}
+              </button>
+              <button type="button" className="duel-exit-button" onClick={returnHome}>
+                退出游戏
+              </button>
+            </div>
           </div>
         )}
 
@@ -3432,22 +3552,42 @@ export default function Home() {
             <span className="lobby-touch-dot" />
             <div>
               <strong>
-                {gameMode === "duel" ? duelStatusLabel[duelStatus] : "拖动角色直接开始"}
+                {gameMode === "duel"
+                  ? duelLobbyJoined
+                    ? duelStatusLabel[duelStatus]
+                    : "创建一场双人比赛"
+                  : "拖动角色直接开始"}
               </strong>
               <span>
-                {gameMode === "duel" ? "匹配成功后自动倒计时" : "向后拉 · 松手起跳"}
+                {gameMode === "duel"
+                  ? duelLobbyJoined
+                    ? "匹配成功后自动倒计时"
+                    : "朋友点邀请链接即可加入"
+                  : "向后拉 · 松手起跳"}
               </span>
             </div>
           </div>
 
-          {gameMode === "duel" && (
+          {gameMode === "duel" && !duelLobbyJoined && (
+            <div className="duel-room-entry" aria-label="创建双人比赛">
+              <span>PRIVATE DUEL</span>
+              <strong>发一个链接，就能开赛</strong>
+              <p>系统会自动创建独立比赛并复制邀请；朋友点开链接后直接加入。</p>
+              <button type="button" onClick={createDuelRoom}>
+                创建比赛并复制邀请
+              </button>
+              <small>无需账号 · 无需输入房间号</small>
+            </div>
+          )}
+
+          {gameMode === "duel" && duelLobbyJoined && (
             <div className={`duel-lobby-status duel-status-${duelStatus}`} role="status">
               <span className="duel-status-dot" />
               <div>
                 <strong>{duelStatusLabel[duelStatus]}</strong>
                 <small>免费网页中继 · 跨 Wi-Fi / 蜂窝网络</small>
               </div>
-              <span className="duel-room-code">房间 {duelRoom.toUpperCase()}</span>
+              <span className="duel-room-code">私人邀请赛</span>
               <button type="button" onClick={copyDuelInvite}>
                 {duelInviteCopied ? "已复制" : "复制邀请"}
               </button>
@@ -3473,7 +3613,7 @@ export default function Home() {
             >
               <span className="ui-icon ui-icon-duel" aria-hidden="true" />
               <strong>双人</strong>
-              <small>双人计时</small>
+              <small>生存竞速</small>
             </button>
             <button className="mode-card" type="button" disabled>
               <span className="ui-icon ui-icon-challenge" aria-hidden="true" />
