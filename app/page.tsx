@@ -2,14 +2,28 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import {
+  chargeToLaunch,
+  dragDistanceToCharge,
+  footSweepContact,
+  pointOnPlatformSurface,
+  sweepBodyAgainstProfile,
+  type FootSweepPoint,
+  type PlatformSurface,
+  type SideSweepContact,
+  type VerticalCollisionProfile,
+} from "./game-physics";
 
 type GamePhase = "idle" | "charging" | "flying" | "falling" | "failed";
 type PlatformShape = "rect" | "circle" | "hex";
+type PlatformKind = "roof" | "city-light" | "signal-mast";
 type AppScreen = "home" | "game" | "settings";
 type BackgroundTheme = "night" | "dawn" | "violet" | "teal";
 
 type Platform = {
   id: number;
+  step: number;
+  kind: PlatformKind;
   group: THREE.Group;
   x: number;
   z: number;
@@ -19,6 +33,22 @@ type Platform = {
   shaftWidth: number;
   shaftDepth: number;
   shape: PlatformShape;
+  surface: PlatformSurface;
+  collisionProfiles: VerticalCollisionProfile[];
+};
+
+type FootContactFrame = [THREE.Vector3[], THREE.Vector3[]];
+
+type LandingContact = {
+  platform: Platform;
+  footIndex: number;
+  supportCount: number;
+  coverage: number;
+  time: number;
+  x: number;
+  z: number;
+  soleCenterX: number;
+  soleCenterZ: number;
 };
 
 type Particle = {
@@ -53,6 +83,30 @@ function isBackgroundTheme(value: string | null): value is BackgroundTheme {
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
+
+function smoothstep(edge0: number, edge1: number, value: number) {
+  const normalized = clamp((value - edge0) / Math.max(0.0001, edge1 - edge0), 0, 1);
+  return normalized * normalized * (3 - 2 * normalized);
+}
+
+// The runner root is placed so the neutral shoe sole is 2.5 mm above it.
+// Keeping this as one explicit contract prevents platform-specific magic offsets.
+const RUNNER_GROUND_OFFSET = 0.0025;
+
+// Sample the visible sole instead of the character's body/root. Index 0 is the
+// sole center; the others cover toe, heel and both edges for stable edge landings.
+const FOOT_SOLE_LOCAL_SAMPLES = (() => {
+  const samples = [new THREE.Vector3(0, -0.0875, 0.02)];
+  const xSamples = [-0.07, -0.035, 0, 0.035, 0.07];
+  const zSamples = [-0.1, -0.04, 0.02, 0.08, 0.14];
+  zSamples.forEach((z) => {
+    xSamples.forEach((x) => {
+      if (x === 0 && z === 0.02) return;
+      samples.push(new THREE.Vector3(x, -0.0875, z));
+    });
+  });
+  return samples;
+})();
 
 function seededNoise(value: number) {
   const x = Math.sin(value * 12.9898 + 78.233) * 43758.5453;
@@ -456,11 +510,15 @@ function createRunner(gradientMap: THREE.Texture) {
 }
 
 function createPlatform(
-  spec: Omit<Platform, "group" | "shaftWidth" | "shaftDepth">,
+  spec: Omit<
+    Platform,
+    "group" | "shaftWidth" | "shaftDepth" | "surface" | "collisionProfiles"
+  >,
   scene: THREE.Scene,
   gradientMap: THREE.Texture,
 ) {
-  const color = palette[spec.id % palette.length];
+  const color = palette[spec.step % palette.length];
+  const isMicroPlatform = spec.kind !== "roof";
   const group = new THREE.Group();
   group.position.set(spec.x, spec.topY, spec.z);
   group.userData.platformId = spec.id;
@@ -496,9 +554,15 @@ function createPlatform(
     depthWrite: false,
   });
 
-  const shaftHeight = 12 + seededNoise(spec.id + 44) * 7;
-  const shaftWidth = spec.width * (spec.shape === "rect" ? 0.88 : 0.91);
-  const shaftDepth = spec.depth * (spec.shape === "rect" ? 0.88 : 0.91);
+  const shaftHeight = isMicroPlatform
+    ? 7.2 + seededNoise(spec.id + 44) * 2.4
+    : 12 + seededNoise(spec.id + 44) * 7;
+  const shaftWidth = isMicroPlatform
+    ? spec.kind === "city-light" ? 0.12 : 0.16
+    : spec.width * (spec.shape === "rect" ? 0.88 : 0.91);
+  const shaftDepth = isMicroPlatform
+    ? spec.kind === "city-light" ? 0.12 : 0.14
+    : spec.depth * (spec.shape === "rect" ? 0.88 : 0.91);
   let roof: THREE.Mesh;
   let rim: THREE.Mesh;
   let shaft: THREE.Mesh;
@@ -506,21 +570,35 @@ function createPlatform(
   if (spec.shape === "circle" || spec.shape === "hex") {
     const segments = spec.shape === "circle" ? 28 : 6;
     const radius = spec.width / 2;
+    // CylinderGeometry's X/Z vertex convention puts a six-sided roof at the
+    // same 30-degree polygon rotation used by the collision surface.
+    const thetaStart = 0;
     shaft = new THREE.Mesh(
       new THREE.CylinderGeometry(
         radius * 0.91,
         radius * 0.98,
         shaftHeight,
         segments,
+        1,
+        false,
+        thetaStart,
       ),
       sideMaterial,
     );
     roof = new THREE.Mesh(
-      new THREE.CylinderGeometry(radius, radius, 0.16, segments),
+      new THREE.CylinderGeometry(radius, radius, 0.16, segments, 1, false, thetaStart),
       roofMaterial,
     );
     rim = new THREE.Mesh(
-      new THREE.CylinderGeometry(radius * 1.045, radius * 1.045, 0.08, segments),
+      new THREE.CylinderGeometry(
+        radius * 1.045,
+        radius * 1.045,
+        0.08,
+        segments,
+        1,
+        false,
+        thetaStart,
+      ),
       rimMaterial,
     );
     rim.position.y = -0.17;
@@ -562,6 +640,41 @@ function createPlatform(
   rim.castShadow = false;
   group.add(shaft, rim, roof);
 
+  if (isMicroPlatform) {
+    const fixtureMaterial = new THREE.MeshToonMaterial({
+      color: spec.kind === "city-light" ? 0x203a4e : 0x26384d,
+      gradientMap,
+    });
+    const lightMaterial = new THREE.MeshBasicMaterial({
+      color: spec.kind === "city-light" ? 0xffa164 : 0x74c6d4,
+      transparent: true,
+      opacity: 0.68,
+    });
+    const arm = new THREE.Mesh(
+      new THREE.BoxGeometry(spec.width * 0.72, 0.065, 0.075),
+      fixtureMaterial,
+    );
+    arm.position.set(
+      spec.kind === "city-light" ? spec.width * 0.13 : 0,
+      -0.29,
+      0,
+    );
+    const light = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        spec.kind === "city-light" ? 0.2 : spec.width * 0.42,
+        0.055,
+        spec.kind === "city-light" ? 0.13 : 0.07,
+      ),
+      lightMaterial,
+    );
+    light.position.set(
+      spec.kind === "city-light" ? spec.width * 0.28 : 0,
+      -0.34,
+      spec.kind === "city-light" ? -0.015 : -0.055,
+    );
+    group.add(arm, light);
+  }
+
   const edgeTrim = new THREE.Group();
   if (spec.shape === "rect") {
     const edgeDepth = 0.018;
@@ -570,10 +683,10 @@ function createPlatform(
     const vertical = new THREE.BoxGeometry(edgeDepth, edgeHeight, spec.depth * 0.74);
     [-1, 1].forEach((side) => {
       const frontBack = new THREE.Mesh(horizontal, seamMaterial);
-      frontBack.position.set(0, 0.008, side * spec.depth * 0.38);
+      frontBack.position.set(0, -0.006, side * spec.depth * 0.38);
       edgeTrim.add(frontBack);
       const leftRight = new THREE.Mesh(vertical, seamMaterial);
-      leftRight.position.set(side * spec.width * 0.39, 0.008, 0);
+      leftRight.position.set(side * spec.width * 0.39, -0.006, 0);
       edgeTrim.add(leftRight);
     });
   } else {
@@ -586,7 +699,7 @@ function createPlatform(
       ),
       seamMaterial,
     );
-    ring.position.y = 0.008;
+    ring.position.y = -0.013;
     ring.rotation.x = Math.PI / 2;
     edgeTrim.add(ring);
   }
@@ -595,7 +708,11 @@ function createPlatform(
   const roofInset = new THREE.Mesh(
     spec.shape === "rect"
       ? new THREE.PlaneGeometry(spec.width * 0.62, spec.depth * 0.58)
-      : new THREE.CircleGeometry(spec.width * 0.3, spec.shape === "hex" ? 6 : 24),
+      : new THREE.CircleGeometry(
+          spec.width * 0.3,
+          spec.shape === "hex" ? 6 : 24,
+          spec.shape === "hex" ? Math.PI / 6 : 0,
+        ),
     new THREE.MeshBasicMaterial({
       color: color.rim,
       transparent: true,
@@ -605,10 +722,10 @@ function createPlatform(
     }),
   );
   roofInset.rotation.x = -Math.PI / 2;
-  roofInset.position.y = 0.004;
+  roofInset.position.y = 0.001;
   group.add(roofInset);
 
-  const bandCount = 2;
+  const bandCount = isMicroPlatform ? 0 : 2;
   for (let i = 0; i < bandCount; i += 1) {
     const band = new THREE.Mesh(
       new THREE.BoxGeometry(0.036, shaftHeight * 0.34, 0.026),
@@ -623,7 +740,7 @@ function createPlatform(
     group.add(band);
   }
 
-  const panelCount = spec.shape === "rect" ? 3 : 2;
+  const panelCount = isMicroPlatform ? 0 : spec.shape === "rect" ? 3 : 2;
   for (let i = 0; i < panelCount; i += 1) {
     const panelWidth = spec.width * (spec.shape === "rect" ? 0.14 : 0.12);
     const panel = new THREE.Mesh(
@@ -654,13 +771,45 @@ function createPlatform(
   );
   halo.name = "platform-breathe";
   halo.rotation.x = -Math.PI / 2;
-  halo.position.y = 0.012;
+  halo.position.y = 0.0015;
   group.add(halo);
 
   group.visible = true;
 
   scene.add(group);
-  return { ...spec, group, shaftWidth, shaftDepth } satisfies Platform;
+  const slabBottom = spec.topY - (isMicroPlatform ? 0.4 : 0.29);
+  const collisionProfiles: VerticalCollisionProfile[] = [
+    {
+      ...spec,
+      topY: spec.topY,
+      bottomY: slabBottom,
+    },
+    {
+      x: spec.x,
+      z: spec.z,
+      width: shaftWidth,
+      depth: shaftDepth,
+      shape: spec.shape,
+      cornerRadius: spec.shape === "rect" ? 0.035 : undefined,
+      topY: slabBottom,
+      bottomY: spec.topY - shaftHeight - 0.24,
+    },
+  ];
+  return {
+    ...spec,
+    group,
+    shaftWidth,
+    shaftDepth,
+    surface: {
+      x: spec.x,
+      z: spec.z,
+      width: spec.width,
+      depth: spec.depth,
+      shape: spec.shape,
+      cornerRadius: spec.shape === "rect" ? 0.055 : undefined,
+    },
+    collisionProfiles,
+  } satisfies Platform;
 }
 
 function createCity(scene: THREE.Scene) {
@@ -708,7 +857,7 @@ function createCity(scene: THREE.Scene) {
       const buildingX = col * 5.2 + (seededNoise(seed + 1) - 0.5) * 1.5;
       // Keep the skyline inside the lower quarter of the portrait camera.
       // The old value placed most roofs below the visible frame.
-      const buildingTop = -4.15 + seededNoise(seed + 8) * 0.72;
+      const buildingTop = -3.25 + seededNoise(seed + 8) * 0.82;
       const buildingY = buildingTop - height / 2;
       const buildingZ = row * 5.2 + (seededNoise(seed + 2) - 0.5) * 1.4;
       const buildingWidth = 1.8 + seededNoise(seed + 3) * 1.7;
@@ -751,101 +900,130 @@ function createCity(scene: THREE.Scene) {
   beacons.instanceMatrix.needsUpdate = true;
   group.add(buildings, windows, beacons);
   scene.add(group);
-  return group;
+  return {
+    group,
+    buildingMaterial: material,
+    windowMaterial,
+    beaconMaterial,
+  };
 }
 
-function pointOnPlatform(platform: Platform, x: number, z: number) {
-  const dx = x - platform.x;
-  const dz = z - platform.z;
-  // A small invisible forgiveness margin makes edge landings feel intentional
-  // without changing the visible rooftop size.
-  const inset = -0.07;
-  if (platform.shape === "rect") {
-    return (
-      Math.abs(dx) <= platform.width / 2 - inset &&
-      Math.abs(dz) <= platform.depth / 2 - inset
+function createGroundReference(scene: THREE.Scene) {
+  const group = new THREE.Group();
+  const groundMaterial = new THREE.MeshBasicMaterial({
+    color: 0x071827,
+    transparent: true,
+    opacity: 0.78,
+    side: THREE.DoubleSide,
+  });
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(72, 190),
+    groundMaterial,
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.set(0, -4.35, 55);
+  ground.renderOrder = -2;
+  group.add(ground);
+
+  const grid = new THREE.GridHelper(190, 76, 0x2f7c8f, 0x17475c);
+  const gridMaterial = grid.material as THREE.LineBasicMaterial;
+  gridMaterial.transparent = true;
+  gridMaterial.opacity = 0.18;
+  gridMaterial.depthWrite = false;
+  grid.position.set(0, -4.32, 55);
+  grid.scale.x = 0.38;
+  group.add(grid);
+
+  scene.add(group);
+  return { group, groundMaterial, gridMaterial };
+}
+
+function createAltitudeAtmosphere(scene: THREE.Scene) {
+  const cloudGeometry = new THREE.IcosahedronGeometry(1, 1);
+  const passageMaterial = new THREE.MeshLambertMaterial({
+    color: 0xa9cbd2,
+    flatShading: true,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+  });
+  const cloudSeaMaterial = passageMaterial.clone();
+  const passageGroup = new THREE.Group();
+  const cloudSeaGroup = new THREE.Group();
+
+  const addCloudCluster = (
+    parent: THREE.Group,
+    seed: number,
+    x: number,
+    y: number,
+    z: number,
+    scale: number,
+    material: THREE.Material,
+  ) => {
+    const cluster = new THREE.Group();
+    cluster.position.set(x, y, z);
+    cluster.rotation.y = (seededNoise(seed + 19) - 0.5) * 0.42;
+    const lobeCount = 3 + Math.floor(seededNoise(seed + 7) * 3);
+    for (let index = 0; index < lobeCount; index += 1) {
+      const lobe = new THREE.Mesh(cloudGeometry, material);
+      const spread = (index - (lobeCount - 1) / 2) * 0.72;
+      lobe.position.set(
+        spread + (seededNoise(seed + index * 5) - 0.5) * 0.42,
+        (seededNoise(seed + index * 11) - 0.45) * 0.38,
+        (seededNoise(seed + index * 17) - 0.5) * 0.62,
+      );
+      lobe.scale.set(
+        scale * (0.72 + seededNoise(seed + index * 23) * 0.55),
+        scale * (0.27 + seededNoise(seed + index * 29) * 0.17),
+        scale * (0.55 + seededNoise(seed + index * 31) * 0.38),
+      );
+      lobe.renderOrder = -1;
+      cluster.add(lobe);
+    }
+    parent.add(cluster);
+  };
+
+  // Leave the route corridor open. The cloud forms live mostly at the sides,
+  // so they describe height without becoming landing obstacles or UI noise.
+  for (let index = 0; index < 10; index += 1) {
+    const side = index % 2 === 0 ? -1 : 1;
+    const seed = 410 + index * 37;
+    addCloudCluster(
+      passageGroup,
+      seed,
+      side * (3.6 + seededNoise(seed) * 2.1),
+      (seededNoise(seed + 3) - 0.5) * 1.25,
+      2 + index * 3.5,
+      0.82 + seededNoise(seed + 5) * 0.62,
+      passageMaterial,
     );
   }
-  const radius = platform.width / 2 - inset;
-  return dx * dx + dz * dz <= radius * radius;
+
+  for (let index = 0; index < 14; index += 1) {
+    const seed = 820 + index * 43;
+    const sideBias = index % 3 === 0 ? 0 : index % 2 === 0 ? -1 : 1;
+    addCloudCluster(
+      cloudSeaGroup,
+      seed,
+      sideBias * (2.1 + seededNoise(seed) * 4.6),
+      (seededNoise(seed + 2) - 0.5) * 0.72,
+      1 + index * 2.45,
+      0.9 + seededNoise(seed + 9) * 0.78,
+      cloudSeaMaterial,
+    );
+  }
+
+  scene.add(passageGroup, cloudSeaGroup);
+  return {
+    passageGroup,
+    cloudSeaGroup,
+    passageMaterial,
+    cloudSeaMaterial,
+  };
 }
 
-type SideCollision = {
-  x: number;
-  z: number;
-  normalX: number;
-  normalZ: number;
-};
-
-function resolveFootprintCollision(
-  platform: Platform,
-  x: number,
-  z: number,
-  radius: number,
-  velocityX: number,
-  velocityZ: number,
-  width = platform.shaftWidth,
-  depth = platform.shaftDepth,
-): SideCollision | null {
-  const dx = x - platform.x;
-  const dz = z - platform.z;
-
-  if (platform.shape !== "rect") {
-    const solidRadius = width / 2;
-    const distance = Math.sqrt(dx * dx + dz * dz);
-    if (distance >= solidRadius + radius) return null;
-    let normalX = distance > 0.0001 ? dx / distance : -Math.sign(velocityX);
-    let normalZ = distance > 0.0001 ? dz / distance : -Math.sign(velocityZ);
-    if (Math.abs(normalX) + Math.abs(normalZ) < 0.001) normalZ = -1;
-    const normalLength = Math.sqrt(normalX * normalX + normalZ * normalZ);
-    normalX /= normalLength;
-    normalZ /= normalLength;
-    return {
-      x: platform.x + normalX * (solidRadius + radius),
-      z: platform.z + normalZ * (solidRadius + radius),
-      normalX,
-      normalZ,
-    };
-  }
-
-  const halfWidth = width / 2;
-  const halfDepth = depth / 2;
-  const closestX = clamp(dx, -halfWidth, halfWidth);
-  const closestZ = clamp(dz, -halfDepth, halfDepth);
-  const cornerX = dx - closestX;
-  const cornerZ = dz - closestZ;
-  const cornerDistance = Math.sqrt(cornerX * cornerX + cornerZ * cornerZ);
-
-  if (cornerDistance > 0.0001) {
-    if (cornerDistance >= radius) return null;
-    const normalX = cornerX / cornerDistance;
-    const normalZ = cornerZ / cornerDistance;
-    return {
-      x: platform.x + closestX + normalX * radius,
-      z: platform.z + closestZ + normalZ * radius,
-      normalX,
-      normalZ,
-    };
-  }
-
-  const exitX = halfWidth - Math.abs(dx);
-  const exitZ = halfDepth - Math.abs(dz);
-  if (exitX < exitZ) {
-    const normalX = Math.sign(dx) || (velocityX >= 0 ? -1 : 1);
-    return {
-      x: platform.x + normalX * (halfWidth + radius),
-      z,
-      normalX,
-      normalZ: 0,
-    };
-  }
-  const normalZ = Math.sign(dz) || (velocityZ >= 0 ? -1 : 1);
-  return {
-    x,
-    z: platform.z + normalZ * (halfDepth + radius),
-    normalX: 0,
-    normalZ,
-  };
+function pointOnPlatform(platform: Platform, x: number, z: number, margin = 0) {
+  return pointOnPlatformSurface(platform.surface, x, z, margin);
 }
 
 export default function Home() {
@@ -860,34 +1038,39 @@ export default function Home() {
   const [hasJumped, setHasJumped] = useState(false);
   const [chargeLevel, setChargeLevel] = useState(0);
   const [altitudeMeters, setAltitudeMeters] = useState(0);
+  const [altitudeZone, setAltitudeZone] = useState("近地楼群");
   const [soundOn, setSoundOn] = useState(true);
   const [screen, setScreen] = useState<AppScreen>("home");
   const [backgroundTheme, setBackgroundTheme] =
-    useState<BackgroundTheme>("night");
+    useState<BackgroundTheme>(() => {
+      if (typeof window === "undefined") return "night";
+      const savedTheme = window.localStorage.getItem("rooftop-leap-theme");
+      return isBackgroundTheme(savedTheme) ? savedTheme : "night";
+    });
 
   useEffect(() => {
     screenRef.current = screen;
   }, [screen]);
-
-  useEffect(() => {
-    const savedTheme = window.localStorage.getItem("rooftop-leap-theme");
-    if (isBackgroundTheme(savedTheme)) setBackgroundTheme(savedTheme);
-  }, []);
 
   const selectBackground = useCallback((theme: BackgroundTheme) => {
     setBackgroundTheme(theme);
     window.localStorage.setItem("rooftop-leap-theme", theme);
   }, []);
 
-  const startGame = useCallback(() => {
-    restartRef.current();
-    setHasJumped(false);
-    setScreen("game");
-  }, []);
-
   const returnHome = useCallback(() => {
     restartRef.current();
     setHasJumped(false);
+    screenRef.current = "home";
+    setScreen("home");
+  }, []);
+
+  const openSettings = useCallback(() => {
+    screenRef.current = "settings";
+    setScreen("settings");
+  }, []);
+
+  const closeSettings = useCallback(() => {
+    screenRef.current = "home";
     setScreen("home");
   }, []);
 
@@ -920,9 +1103,13 @@ export default function Home() {
     let charge = 0;
     let launchCharge = 0;
     let chargeFeedbackBand = 0;
-    let targetDirection = new THREE.Vector3(0, 0, 1);
-    let launchPlatformId = 0;
+    const targetDirection = new THREE.Vector3(0, 0, 1);
+    let launchPlatformStep = 0;
     let platforms: Platform[] = [];
+    let nextPlatformId = 0;
+    let generatedThroughStep = 0;
+    let generatedRow: Platform[] = [];
+    let lastChoiceStep = -10;
     let currentPlatform!: Platform;
     let particles: Particle[] = [];
     let landingSquash = 0;
@@ -931,13 +1118,17 @@ export default function Home() {
     let fallElapsed = 0;
     let fallReferenceY = 0;
     let fallSpin = 1;
-    let fallPlatform: Platform | null = null;
-    let fallHasWallContact = false;
+    let fallCollisionCooldown = 0;
+    let fallImpactReaction = 0;
+    const fallImpactNormal = new THREE.Vector2();
 
     setBest(bestValue);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x0b2137, 0.036);
+    const sceneFog = new THREE.FogExp2(0x0b2137, 0.036);
+    scene.fog = sceneFog;
+    const lowAltitudeFog = new THREE.Color(0x0b2137);
+    const highAltitudeFog = new THREE.Color(0x315f78);
 
     const renderer = new THREE.WebGLRenderer({
       antialias: true,
@@ -975,7 +1166,10 @@ export default function Home() {
     scene.add(coolRim);
 
     const toonGradient = createToonGradient();
-    const city = createCity(scene);
+    const groundReference = createGroundReference(scene);
+    const cityBackdrop = createCity(scene);
+    const city = cityBackdrop.group;
+    const altitudeAtmosphere = createAltitudeAtmosphere(scene);
     const runner = createRunner(toonGradient);
     scene.add(runner);
     const contactShadowMaterial = new THREE.MeshBasicMaterial({
@@ -1026,6 +1220,78 @@ export default function Home() {
     const headRig = runnerVisual.getObjectByName("head-rig") as THREE.Group;
     const scarf = runnerVisual.getObjectByName("scarf") as THREE.Mesh;
     const velocity = new THREE.Vector3();
+    const movementStart = new THREE.Vector3();
+
+    const createFootFrame = (): FootContactFrame => [
+      FOOT_SOLE_LOCAL_SAMPLES.map(() => new THREE.Vector3()),
+      FOOT_SOLE_LOCAL_SAMPLES.map(() => new THREE.Vector3()),
+    ];
+    let previousFootFrame = createFootFrame();
+    let currentFootFrame = createFootFrame();
+    const shoes = [leftShoe, rightShoe] as const;
+
+    const captureFootFrame = (frame: FootContactFrame) => {
+      runner.updateMatrixWorld(true);
+      shoes.forEach((shoe, footIndex) => {
+        FOOT_SOLE_LOCAL_SAMPLES.forEach((localPoint, sampleIndex) => {
+          frame[footIndex][sampleIndex]
+            .copy(localPoint)
+            .applyMatrix4(shoe.matrixWorld);
+        });
+      });
+    };
+
+    const findLandingContact = (): LandingContact | null => {
+      let bestContact: LandingContact | null = null;
+      platforms.forEach((platform) => {
+        previousFootFrame.forEach((previousPoints, footIndex) => {
+          const contact = footSweepContact(
+            platform.surface,
+            platform.topY,
+            previousPoints as readonly FootSweepPoint[],
+            currentFootFrame[footIndex] as readonly FootSweepPoint[],
+          );
+          if (!contact.valid) return;
+          const candidate: LandingContact = {
+            platform,
+            footIndex,
+            supportCount: contact.supportCount,
+            coverage: contact.coverage,
+            time: contact.time,
+            x: contact.x,
+            z: contact.z,
+            soleCenterX: contact.soleCenterX,
+            soleCenterZ: contact.soleCenterZ,
+          };
+          if (
+            !bestContact ||
+            candidate.time < bestContact.time - 0.0001 ||
+            (Math.abs(candidate.time - bestContact.time) < 0.0001 &&
+              platform.topY > bestContact.platform.topY)
+          ) {
+            bestContact = candidate;
+          }
+        });
+      });
+      return bestContact;
+    };
+
+    const footFrameClearedPlatform = (platform: Platform) => {
+      const aSampleCrossedThisFrame = previousFootFrame.some(
+        (previousPoints, footIndex) =>
+          previousPoints.some((previousPoint, sampleIndex) => {
+            const currentPoint = currentFootFrame[footIndex][sampleIndex];
+            return previousPoint.y >= platform.topY && currentPoint.y <= platform.topY;
+          }),
+      );
+      // Do not fail on the first unsupported toe corner: the other foot may
+      // still be descending onto the roof. A miss is final only after both
+      // visible soles have cleared the surface without a valid contact.
+      const bothSolesBelow = currentFootFrame.every((points) =>
+        points.every((point) => point.y < platform.topY - 0.012),
+      );
+      return aSampleCrossedThisFrame && bothSolesBelow;
+    };
 
     const ensureAudio = () => {
       if (!soundRef.current) return null;
@@ -1122,22 +1388,30 @@ export default function Home() {
       noticeTimer = window.setTimeout(() => setNotice(""), 700);
     };
 
-    const makeNextPlatform = (from: Platform, id: number) => {
-      const difficulty = Math.min(id / 30, 1);
-      const shapeRoll = seededNoise(id * 4.31);
+    const makeRouteRow = (previousRow: Platform[], step: number) => {
+      const difficulty = Math.min(step / 30, 1);
+      const shapeRoll = seededNoise(step * 4.31);
       const shape: PlatformShape =
-        id < 2 ? "rect" : shapeRoll > 0.72 ? "circle" : shapeRoll > 0.5 ? "hex" : "rect";
-      const size = 1.52 - difficulty * 0.18 + seededNoise(id + 8) * 0.2;
+        step < 2
+          ? "rect"
+          : shapeRoll > 0.72
+            ? "circle"
+            : shapeRoll > 0.5
+              ? "hex"
+              : "rect";
+      const size = 1.52 - difficulty * 0.18 + seededNoise(step + 8) * 0.2;
       const width = shape === "rect" ? size : size * 0.96;
-      const depth = shape === "rect" ? size * (0.84 + seededNoise(id + 12) * 0.16) : width;
-      const distanceRoll = seededNoise(id * 8.73 + 18);
+      const depth = shape === "rect"
+        ? size * (0.84 + seededNoise(step + 12) * 0.16)
+        : width;
+      const distanceRoll = seededNoise(step * 8.73 + 18);
       let gap: number;
-      if (id === 1) {
+      if (step === 1) {
         gap = 1.08;
-      } else if (id === 2) {
+      } else if (step === 2) {
         gap = 1.46;
       } else {
-        const distanceTier = id % 6;
+        const distanceTier = step % 6;
         if (distanceTier === 0 || distanceTier === 3) {
           gap = 0.9 + distanceRoll * 0.42;
         } else if (distanceTier === 1 || distanceTier === 5) {
@@ -1146,19 +1420,25 @@ export default function Home() {
           gap = 2.72 + distanceRoll * 0.78 + difficulty * 0.22;
         }
       }
-      const z = from.z + from.depth / 2 + gap + depth / 2;
-      const lateralRoll = seededNoise(id * 5.17 + 30);
+      const anchorX = previousRow.reduce((sum, platform) => sum + platform.x, 0) /
+        previousRow.length;
+      const previousFront = Math.max(
+        ...previousRow.map((platform) => platform.z + platform.depth / 2),
+      );
+      const previousTopY = Math.max(...previousRow.map((platform) => platform.topY));
+      const z = previousFront + gap + depth / 2;
+      const lateralRoll = seededNoise(step * 5.17 + 30);
       let x: number;
-      if (id === 1) {
+      if (step === 1) {
         x = 0.2;
       } else {
         const lanePattern = [0, 0.2, -0.95, 0.45, 1.25, 0.15, -1.15, -0.35, 1.05];
         const laneTarget =
-          lanePattern[((id - 1) % (lanePattern.length - 1)) + 1] +
+          lanePattern[((step - 1) % (lanePattern.length - 1)) + 1] +
           (lateralRoll - 0.5) * 0.16;
         const maxStep = gap > 2.5 ? 1.72 : gap > 1.5 ? 1.5 : 1.35;
         x = clamp(
-          from.x + clamp(laneTarget - from.x, -maxStep, maxStep),
+          anchorX + clamp(laneTarget - anchorX, -maxStep, maxStep),
           -2.05,
           2.05,
         );
@@ -1167,19 +1447,97 @@ export default function Home() {
       // world-space rise, so the skyline and cloud deck sink below the player
       // instead of the route feeling like a flat conveyor belt.
       const rise =
-        0.09 +
-        seededNoise(id + 60) * 0.115 +
-        difficulty * 0.025 +
-        (id % 7 === 0 ? 0.035 : 0);
-      const topY = from.topY + rise;
-      return createPlatform(
-        { id, x, z, topY, width, depth, shape },
+        0.14 +
+        seededNoise(step + 60) * 0.14 +
+        difficulty * 0.035 +
+        (step % 7 === 0 ? 0.055 : 0);
+      const topY = previousTopY + rise;
+      const createRoutePlatform = (
+        platformX: number,
+        platformZ: number,
+        platformWidth: number,
+        platformDepth: number,
+        platformShape: PlatformShape,
+        kind: PlatformKind,
+      ) => createPlatform(
+        {
+          id: nextPlatformId++,
+          step,
+          kind,
+          x: platformX,
+          z: platformZ,
+          topY,
+          width: platformWidth,
+          depth: platformDepth,
+          shape: platformShape,
+        },
         scene,
         toonGradient,
       );
+
+      // Choices are punctuation, not the default rhythm. A split appears only
+      // once every ten steps and immediately merges back into one route row.
+      const canIntroduceChoice = step - lastChoiceStep >= 5;
+      const isSplitRow = canIntroduceChoice && step >= 6 && step % 10 === 6;
+      if (isSplitRow) {
+        lastChoiceStep = step;
+        const centerX = clamp(x, -0.62, 0.62);
+        const branchWidth = clamp(width * 0.82, 1.08, 1.26);
+        const branchDepth = clamp(depth * 0.88, 1.02, 1.3);
+        return [
+          createRoutePlatform(
+            centerX - 0.92,
+            z,
+            branchWidth,
+            branchDepth,
+            "rect",
+            "roof",
+          ),
+          createRoutePlatform(
+            centerX + 0.92,
+            z + 0.04,
+            branchWidth,
+            branchDepth,
+            "rect",
+            "roof",
+          ),
+        ];
+      }
+
+      // Even rarer rows pair a safe roof with a genuinely landable narrow
+      // urban fixture. It reads as scenery first but obeys the same sole test.
+      const isMicroChoiceRow =
+        canIntroduceChoice && step >= 9 && step % 13 === 9;
+      if (isMicroChoiceRow) {
+        lastChoiceStep = step;
+        const side = x > 0.15 ? -1 : 1;
+        let microX = clamp(x + side * 1.24, -2.05, 2.05);
+        if (Math.abs(microX - x) < 0.82) {
+          microX = clamp(x - side * 1.24, -2.05, 2.05);
+        }
+        const kind: PlatformKind = step % 2 === 0 ? "signal-mast" : "city-light";
+        return [
+          createRoutePlatform(x, z, width, depth, shape, "roof"),
+          createRoutePlatform(
+            microX,
+            z + 0.08,
+            kind === "city-light" ? 0.62 : 0.56,
+            kind === "city-light" ? 0.48 : 0.52,
+            "rect",
+            kind,
+          ),
+        ];
+      }
+
+      return [createRoutePlatform(x, z, width, depth, shape, "roof")];
     };
 
-    const spawnLandingParticles = (platform: Platform, perfect: boolean) => {
+    const spawnLandingParticles = (
+      platform: Platform,
+      perfect: boolean,
+      contactX = runner.position.x,
+      contactZ = runner.position.z,
+    ) => {
       const count = perfect ? 20 : 10;
       const color = perfect ? 0xffd28a : 0xd8f3ed;
       for (let i = 0; i < count; i += 1) {
@@ -1192,7 +1550,7 @@ export default function Home() {
           }),
         );
         const angle = (i / count) * Math.PI * 2 + seededNoise(i + scoreValue) * 0.4;
-        mesh.position.set(runner.position.x, platform.topY + 0.05, runner.position.z);
+        mesh.position.set(contactX, platform.topY + 0.05, contactZ);
         scene.add(mesh);
         particles.push({
           mesh,
@@ -1247,31 +1605,40 @@ export default function Home() {
       // rooftops are created in fog instead of popping into the upper frame.
       const lookAheadCount = 14;
       const lookAheadDistance = 52;
-      let tail = platforms.reduce(
-        (furthest, platform) => platform.id > furthest.id ? platform : furthest,
-        from,
-      );
       while (
-        tail.id < from.id + lookAheadCount ||
-        tail.z < from.z + lookAheadDistance
+        generatedThroughStep < from.step + lookAheadCount ||
+        Math.max(...generatedRow.map((platform) => platform.z)) <
+          from.z + lookAheadDistance
       ) {
-        const next = makeNextPlatform(tail, tail.id + 1);
-        platforms.push(next);
-        tail = next;
+        const nextStep = generatedThroughStep + 1;
+        const nextRow = makeRouteRow(generatedRow, nextStep);
+        platforms.push(...nextRow);
+        generatedRow = nextRow;
+        generatedThroughStep = nextStep;
       }
       return platforms
-        .filter((platform) => platform.id > from.id)
-        .sort((a, b) => a.id - b.id);
+        .filter((platform) => platform.step > from.step)
+        .sort((a, b) => a.step - b.step || a.id - b.id);
     };
 
     const updatePathFocus = (snap = false) => {
-      const upcoming = platforms
-        .filter((platform) => platform.id > currentPlatform.id)
-        .sort((a, b) => a.id - b.id);
-      const next = upcoming[0];
+      const upcomingSteps = Array.from(new Set(
+        platforms
+          .filter((platform) => platform.step > currentPlatform.step)
+          .map((platform) => platform.step),
+      )).sort((a, b) => a - b);
+      const rowCenter = (step: number) => {
+        const row = platforms.filter((platform) => platform.step === step);
+        return {
+          x: row.reduce((sum, platform) => sum + platform.x, 0) / row.length,
+          z: row.reduce((sum, platform) => sum + platform.z, 0) / row.length,
+          topY: Math.max(...row.map((platform) => platform.topY)),
+        };
+      };
+      const next = upcomingSteps[0] === undefined ? null : rowCenter(upcomingSteps[0]);
       if (!next) return;
-      const second = upcoming[1] ?? next;
-      const third = upcoming[2] ?? second;
+      const second = upcomingSteps[1] === undefined ? next : rowCenter(upcomingSteps[1]);
+      const third = upcomingSteps[2] === undefined ? second : rowCenter(upcomingSteps[2]);
       const routeX = next.x * 0.62 + second.x * 0.26 + third.x * 0.12;
       const cameraLookAhead = clamp(
         (second.z - currentPlatform.z) * 0.34,
@@ -1295,39 +1662,7 @@ export default function Home() {
       setPhase(next);
     };
 
-    const resetPlatforms = () => {
-      platforms.forEach((platform) => {
-        scene.remove(platform.group);
-        disposeObject(platform.group);
-      });
-      platforms = [];
-      currentPlatform = createPlatform(
-        {
-          id: 0,
-          x: 0,
-          z: 0,
-          topY: 0,
-          width: 1.82,
-          depth: 1.62,
-          shape: "rect",
-        },
-        scene,
-        toonGradient,
-      );
-      platforms.push(currentPlatform);
-      ensurePathAhead(currentPlatform);
-    };
-
-    const restart = () => {
-      resetPlatforms();
-      scoreValue = 0;
-      setScore(0);
-      setAltitudeMeters(0);
-      setChargeLevel(0);
-      setNotice("");
-      runner.position.set(currentPlatform.x, currentPlatform.topY + 0.01, currentPlatform.z);
-      runner.rotation.set(0, 0, 0);
-      runner.visible = true;
+    const settleGroundedPose = () => {
       runnerVisual.position.set(0, 0, 0);
       runnerVisual.rotation.set(0, 0, 0);
       runnerVisual.scale.set(1, 1, 1);
@@ -1347,19 +1682,111 @@ export default function Home() {
       rightShoe.position.z = 0.085;
       rightShoe.rotation.set(0, 0, 0);
       scarf.rotation.set(-0.28, 0, 0);
+    };
+
+    const minimumFootSupport = Math.max(
+      2,
+      Math.ceil(FOOT_SOLE_LOCAL_SAMPLES.length * 0.32),
+    );
+
+    const placeGroundedRunner = (
+      platform: Platform,
+      contact: LandingContact,
+    ) => {
+      runner.position.y = platform.topY + RUNNER_GROUND_OFFSET;
+      settleGroundedPose();
+      captureFootFrame(currentFootFrame);
+
+      // Preserve the actual foot that made contact when the flailing pose is
+      // folded back into the neutral standing pose.
+      const neutralCenter = currentFootFrame[contact.footIndex][0];
+      const correctionX = contact.soleCenterX - neutralCenter.x;
+      const correctionZ = contact.soleCenterZ - neutralCenter.z;
+      const correctionLength = Math.hypot(correctionX, correctionZ);
+      const correctionScale = correctionLength > 0.24 ? 0.24 / correctionLength : 1;
+      runner.position.x += correctionX * correctionScale;
+      runner.position.z += correctionZ * correctionScale;
+
+      // If pose normalization leaves too little of that sole supported, make a
+      // tiny inward adjustment until the visible standing pose and collider
+      // agree. The maximum movement is deliberately below one shoe length.
+      for (let iteration = 0; iteration < 16; iteration += 1) {
+        captureFootFrame(currentFootFrame);
+        const supportedSamples = currentFootFrame[contact.footIndex].filter((point) =>
+          pointOnPlatformSurface(platform.surface, point.x, point.z, 0.002),
+        ).length;
+        if (supportedSamples >= minimumFootSupport) break;
+        const footCenter = currentFootFrame[contact.footIndex][0];
+        const inwardX = platform.x - footCenter.x;
+        const inwardZ = platform.z - footCenter.z;
+        const inwardLength = Math.hypot(inwardX, inwardZ);
+        if (inwardLength < 0.0001) break;
+        runner.position.x += (inwardX / inwardLength) * 0.012;
+        runner.position.z += (inwardZ / inwardLength) * 0.012;
+      }
+    };
+
+    const resetPlatforms = () => {
+      platforms.forEach((platform) => {
+        scene.remove(platform.group);
+        disposeObject(platform.group);
+      });
+      platforms = [];
+      nextPlatformId = 0;
+      generatedThroughStep = 0;
+      generatedRow = [];
+      lastChoiceStep = -10;
+      currentPlatform = createPlatform(
+        {
+          id: nextPlatformId++,
+          step: 0,
+          kind: "roof",
+          x: 0,
+          z: 0,
+          topY: 0,
+          width: 1.82,
+          depth: 1.62,
+          shape: "rect",
+        },
+        scene,
+        toonGradient,
+      );
+      platforms.push(currentPlatform);
+      generatedRow = [currentPlatform];
+      ensurePathAhead(currentPlatform);
+    };
+
+    const restart = () => {
+      resetPlatforms();
+      scoreValue = 0;
+      setScore(0);
+      setAltitudeMeters(0);
+      setAltitudeZone("近地楼群");
+      setChargeLevel(0);
+      setNotice("");
+      runner.position.set(
+        currentPlatform.x,
+        currentPlatform.topY + RUNNER_GROUND_OFFSET,
+        currentPlatform.z,
+      );
+      runner.rotation.set(0, 0, 0);
+      runner.visible = true;
+      settleGroundedPose();
       velocity.set(0, 0, 0);
-      launchPlatformId = currentPlatform.id;
+      launchPlatformStep = currentPlatform.step;
       charge = 0;
       launchCharge = 0;
       dragDistance = 0;
       chargeFeedbackBand = 0;
       fallElapsed = 0;
-      fallPlatform = null;
-      fallHasWallContact = false;
+      fallCollisionCooldown = 0;
+      fallImpactReaction = 0;
+      fallImpactNormal.set(0, 0);
       chargeMaterial.opacity = 0;
       tensionLines.visible = false;
       tensionMaterial.opacity = 0;
       updatePathFocus(true);
+      captureFootFrame(previousFootFrame);
       setInternalPhase("idle");
     };
     restartRef.current = restart;
@@ -1375,7 +1802,7 @@ export default function Home() {
     };
 
     const applySideCollision = (
-      collision: SideCollision,
+      collision: SideSweepContact,
       damping: number,
       outwardPush: number,
     ) => {
@@ -1391,38 +1818,53 @@ export default function Home() {
       }
       velocity.x = nextX * damping + collision.normalX * outwardPush;
       velocity.z = nextZ * damping + collision.normalZ * outwardPush;
+      fallImpactReaction = 1;
+      fallImpactNormal.set(collision.normalX, collision.normalZ);
       fallSpin =
         Math.abs(collision.normalX) > 0.16
           ? -Math.sign(collision.normalX)
           : Math.sign(collision.normalZ) || 1;
     };
 
-    const beginFall = (platform: Platform) => {
+    const findSideCollision = (
+      previousPosition: THREE.Vector3,
+      currentPosition: THREE.Vector3,
+    ) => {
+      let bestHit: { platform: Platform; collision: SideSweepContact } | null = null;
+      platforms.forEach((platform) => {
+        platform.collisionProfiles.forEach((profile) => {
+          const collision = sweepBodyAgainstProfile(
+            profile,
+            previousPosition,
+            currentPosition,
+          );
+          if (!collision) return;
+          if (!bestHit || collision.time < bestHit.collision.time) {
+            bestHit = { platform, collision };
+          }
+        });
+      });
+      return bestHit;
+    };
+
+    const beginFall = (
+      platform: Platform,
+      previousPosition: THREE.Vector3 = runner.position,
+    ) => {
       if (gamePhase !== "flying") return;
       setInternalPhase("falling");
       fallElapsed = 0;
       fallReferenceY = platform.topY;
-      fallPlatform = platform;
-      fallHasWallContact = false;
+      fallCollisionCooldown = 0;
       fallSpin = velocity.x >= 0 ? -1 : 1;
 
-      const edgeCollision = resolveFootprintCollision(
-        platform,
-        runner.position.x,
-        runner.position.z,
-        0.19,
-        velocity.x,
-        velocity.z,
-        platform.width,
-        platform.depth,
-      );
-      if (edgeCollision) {
-        applySideCollision(edgeCollision, 0.38, 1.05);
-        runner.position.y = platform.topY + 0.015;
+      const edgeHit = findSideCollision(previousPosition, runner.position);
+      if (edgeHit) {
+        applySideCollision(edgeHit.collision, 0.38, 1.05);
         velocity.y = -1.35;
         runnerVisual.rotation.z = -fallSpin * 0.42;
         cameraKick = 0.2;
-        spawnMissParticles(platform);
+        spawnMissParticles(edgeHit.platform, runner.position.y + 0.34);
         playSound("scrape");
         if (navigator.vibrate) navigator.vibrate([28, 24, 38]);
       } else {
@@ -1431,50 +1873,60 @@ export default function Home() {
       }
     };
 
-    const landBack = (platform: Platform) => {
-      runner.position.y = platform.topY + 0.01;
+    const landBack = (platform: Platform, contact: LandingContact) => {
+      placeGroundedRunner(platform, contact);
       velocity.set(0, 0, 0);
-      fallPlatform = null;
       landingSquash = 0.62;
       cameraKick = 0.08;
       setChargeLevel(0);
       flashNotice(launchCharge < 0.16 ? "轻跳" : "差一点，再来");
       playSound("land");
+      spawnLandingParticles(platform, false, contact.x, contact.z);
+      captureFootFrame(previousFootFrame);
       setInternalPhase("idle");
     };
 
-    const land = (platform: Platform) => {
-      runner.position.y = platform.topY + 0.01;
+    const land = (platform: Platform, contact: LandingContact) => {
+      placeGroundedRunner(platform, contact);
       velocity.set(0, 0, 0);
-      fallPlatform = null;
-      const dx = runner.position.x - platform.x;
-      const dz = runner.position.z - platform.z;
+      const dx = contact.x - platform.x;
+      const dz = contact.z - platform.z;
       const normalizedDistance =
         Math.sqrt(dx * dx + dz * dz) / Math.max(0.5, platform.width / 2);
       const perfect = normalizedDistance < 0.24;
       scoreValue += perfect ? 2 : 1;
       setScore(scoreValue);
-      setAltitudeMeters(Math.round(platform.id * 5.5 + platform.topY * 4));
+      setAltitudeMeters(Math.round(platform.step * 5.5 + platform.topY * 4));
+      setAltitudeZone(
+        platform.step < 6
+          ? "近地楼群"
+          : platform.step < 12
+            ? "城市上空"
+            : platform.step < 19
+              ? "穿越云层"
+              : "云海高空",
+      );
       bestValue = Math.max(bestValue, scoreValue);
       setBest(bestValue);
       window.localStorage.setItem("rooftop-leap-best", String(bestValue));
       flashNotice(perfect ? "完美落点  +2" : "+1");
-      spawnLandingParticles(platform, perfect);
+      spawnLandingParticles(platform, perfect, contact.x, contact.z);
       landingSquash = 1;
       cameraKick = perfect ? 0.24 : 0.13;
       playSound(perfect ? "perfect" : "land");
       if (navigator.vibrate) navigator.vibrate(perfect ? [18, 28, 20] : 18);
 
       currentPlatform = platform;
-      launchPlatformId = platform.id;
+      launchPlatformStep = platform.step;
       setInternalPhase("idle");
       ensurePathAhead(currentPlatform);
       updatePathFocus();
-      const landedPlatformId = currentPlatform.id;
+      captureFootFrame(previousFootFrame);
+      const landedPlatformStep = currentPlatform.step;
       window.setTimeout(() => {
         if (destroyed) return;
         platforms
-          .filter((candidate) => candidate.id < landedPlatformId)
+          .filter((candidate) => candidate.step < landedPlatformStep)
           .forEach(removePlatform);
       }, 220);
     };
@@ -1492,16 +1944,14 @@ export default function Home() {
         setInternalPhase("idle");
         return;
       }
-      const effectiveCharge = Math.max(0.012, charge);
-      // The old minimum velocity was already a medium jump. These curves keep
-      // the full-distance range while giving the first few pixels of drag a
-      // genuinely tiny, nearly in-place hop.
-      const speed = 0.22 + Math.pow(effectiveCharge, 0.78) * 6.12;
-      const lift = 2.45 + Math.pow(effectiveCharge, 0.55) * 3.55;
+      const effectiveCharge = Math.max(0.004, charge);
+      // Horizontal reach grows more slowly through the first half of the pull,
+      // while lift begins gently and remains predictable. Tiny gestures now
+      // produce a real hop instead of snapping into a medium-distance jump.
+      const { speed, lift } = chargeToLaunch(effectiveCharge);
       velocity.set(targetDirection.x * speed, lift, targetDirection.z * speed);
       launchCharge = effectiveCharge;
-      fallPlatform = null;
-      launchPlatformId = currentPlatform.id;
+      launchPlatformStep = currentPlatform.step;
       setInternalPhase("flying");
       setHasJumped(true);
       chargeMaterial.opacity = 0;
@@ -1510,6 +1960,7 @@ export default function Home() {
       runnerVisual.scale.set(1, 1, 1);
       runnerVisual.position.set(0, 0, 0);
       setChargeLevel(0);
+      captureFootFrame(previousFootFrame);
       playSound("jump", effectiveCharge);
     };
 
@@ -1518,16 +1969,15 @@ export default function Home() {
       // the visible jump direction opposite to the player's pull direction.
       const pullX = dragCurrent.x - dragStart.x;
       const actualPullForward = Math.max(0, dragCurrent.y - dragStart.y);
-      const pullForward = Math.max(22, actualPullForward);
+      const pullForward = 14 + actualPullForward;
       const rawDistance = Math.sqrt(
         pullX * pullX + actualPullForward * actualPullForward,
       );
       dragDistance = rawDistance;
-      const linearCharge = clamp(rawDistance / 182, 0, 1);
-      charge = Math.pow(linearCharge, 1.08);
-      const touchIntent = clamp(rawDistance / 12, 0, 1);
+      charge = dragDistanceToCharge(rawDistance);
+      const touchIntent = clamp((rawDistance - 1.5) / 13.5, 0, 1);
       const poseAmount = Math.max(charge, touchIntent * 0.1);
-      targetDirection.set(pullX * 0.66, 0, pullForward).normalize();
+      targetDirection.set(pullX * 0.7, 0, pullForward).normalize();
       runner.rotation.y = Math.atan2(targetDirection.x, targetDirection.z);
       runnerVisual.scale.set(
         1 + poseAmount * 0.055,
@@ -1535,7 +1985,9 @@ export default function Home() {
         1 + poseAmount * 0.055,
       );
       runnerVisual.position.x = -targetDirection.x * poseAmount * 0.24;
-      runnerVisual.position.y = -poseAmount * 0.065;
+      // Crouch around the sole anchor. Lowering the whole rig pushed the shoes
+      // through the roof and made the charge pose contradict the collider.
+      runnerVisual.position.y = 0;
       runnerVisual.position.z = -targetDirection.z * poseAmount * 0.26;
       runnerVisual.rotation.x = poseAmount * 0.23;
       runnerVisual.rotation.z = -targetDirection.x * poseAmount * 0.17;
@@ -1585,8 +2037,15 @@ export default function Home() {
     };
 
     const onPointerDown = (event: PointerEvent) => {
-      if (screenRef.current !== "game" || gamePhase !== "idle") return;
+      if (screenRef.current === "settings" || gamePhase !== "idle") return;
       event.preventDefault();
+      if (screenRef.current === "home") {
+        // The playable world is the lobby: the first drag dismisses the edge
+        // navigation and becomes the first charge gesture without an extra tap.
+        screenRef.current = "game";
+        setScreen("game");
+        setHasJumped(false);
+      }
       activePointer = event.pointerId;
       dragStart = { x: event.clientX, y: event.clientY };
       dragCurrent = { ...dragStart };
@@ -1639,7 +2098,12 @@ export default function Home() {
 
     resetPlatforms();
     updatePathFocus(true);
-    runner.position.set(currentPlatform.x, currentPlatform.topY + 0.01, currentPlatform.z);
+    runner.position.set(
+      currentPlatform.x,
+      currentPlatform.topY + RUNNER_GROUND_OFFSET,
+      currentPlatform.z,
+    );
+    captureFootFrame(previousFootFrame);
 
     const clock = new THREE.Clock();
     let animationFrame = 0;
@@ -1650,7 +2114,7 @@ export default function Home() {
       elapsed += dt;
 
       if (gamePhase === "flying") {
-        const previousY = runner.position.y;
+        movementStart.copy(runner.position);
         velocity.y -= 12.6 * dt;
         runner.position.addScaledVector(velocity, dt);
         const flail = elapsed * 13.5;
@@ -1697,66 +2161,74 @@ export default function Home() {
         scarf.rotation.x = -0.45 + Math.sin(flail * 1.45) * 0.22;
         scarf.rotation.y = Math.sin(flail * 0.76) * 0.24;
 
+        captureFootFrame(currentFootFrame);
         if (velocity.y <= 0) {
-          const landingPlatform = platforms.find(
-            (platform) =>
-              previousY >= platform.topY &&
-              runner.position.y <= platform.topY &&
-              pointOnPlatform(platform, runner.position.x, runner.position.z),
-          );
-          if (landingPlatform) {
-            if (landingPlatform.id === launchPlatformId) landBack(landingPlatform);
-            else land(landingPlatform);
+          const landingContact = findLandingContact();
+          if (landingContact) {
+            if (landingContact.platform.step === launchPlatformStep) {
+              landBack(landingContact.platform, landingContact);
+            } else {
+              land(landingContact.platform, landingContact);
+            }
           } else {
-            const missedPlatform = platforms.find(
-              (platform) =>
-                platform.id === launchPlatformId + 1 &&
-                previousY >= platform.topY &&
-                runner.position.y <= platform.topY,
-            );
-            if (missedPlatform) beginFall(missedPlatform);
+            const missedPlatform = platforms
+              .filter(
+                (platform) =>
+                  platform.step === launchPlatformStep + 1 &&
+                  footFrameClearedPlatform(platform),
+              )
+              .sort((a, b) =>
+                Math.hypot(runner.position.x - a.x, runner.position.z - a.z) -
+                Math.hypot(runner.position.x - b.x, runner.position.z - b.z)
+              )[0];
+            if (missedPlatform) beginFall(missedPlatform, movementStart);
           }
+        }
+        if (gamePhase === "flying") {
+          const completedFrame = previousFootFrame;
+          previousFootFrame = currentFootFrame;
+          currentFootFrame = completedFrame;
         }
         if (gamePhase === "flying" && (
           runner.position.y < currentPlatform.topY - 6.5 ||
           runner.position.z < currentPlatform.z - 4
         )) {
           const targetPlatform = platforms.find(
-            (platform) => platform.id === launchPlatformId + 1,
+            (platform) => platform.step === launchPlatformStep + 1,
           );
-          if (targetPlatform) beginFall(targetPlatform);
+          if (targetPlatform) beginFall(targetPlatform, movementStart);
           else fail();
         }
       } else if (gamePhase === "falling") {
         fallElapsed += dt;
+        fallCollisionCooldown = Math.max(0, fallCollisionCooldown - dt);
+        movementStart.copy(runner.position);
         velocity.y -= 14.8 * dt;
         runner.position.addScaledVector(velocity, dt);
-        if (
-          fallPlatform &&
-          !fallHasWallContact &&
-          runner.position.y < fallPlatform.topY - 0.08 &&
-          runner.position.y > fallPlatform.topY - 5.4
-        ) {
-          const wallCollision = resolveFootprintCollision(
-            fallPlatform,
-            runner.position.x,
-            runner.position.z,
-            0.18,
-            velocity.x,
-            velocity.z,
-          );
-          if (wallCollision) {
-            applySideCollision(wallCollision, 0.44, 0.82);
+        if (fallCollisionCooldown <= 0) {
+          const wallHit = findSideCollision(movementStart, runner.position);
+          if (wallHit) {
+            applySideCollision(wallHit.collision, 0.44, 0.82);
             velocity.y = Math.min(velocity.y, -1.55);
-            fallHasWallContact = true;
+            fallCollisionCooldown = 0.075;
             cameraKick = Math.max(cameraKick, 0.16);
-            spawnMissParticles(fallPlatform, runner.position.y + 0.34);
+            spawnMissParticles(wallHit.platform, runner.position.y + 0.34);
             playSound("scrape");
             if (navigator.vibrate) navigator.vibrate(24);
           }
         }
         const tumble = elapsed * 15.5;
-        runnerVisual.position.y = Math.sin(tumble * 0.7) * 0.025;
+        fallImpactReaction = Math.max(0, fallImpactReaction - dt * 4.6);
+        runnerVisual.position.set(
+          fallImpactNormal.x * fallImpactReaction * 0.075,
+          Math.sin(tumble * 0.7) * 0.025 - fallImpactReaction * 0.035,
+          fallImpactNormal.y * fallImpactReaction * 0.075,
+        );
+        runnerVisual.scale.set(
+          1 + fallImpactReaction * 0.065,
+          1 - fallImpactReaction * 0.11,
+          1 + fallImpactReaction * 0.025,
+        );
         runnerVisual.rotation.x += dt * (2.1 + fallElapsed * 2.4);
         runnerVisual.rotation.z += dt * fallSpin * (2.8 + fallElapsed * 3.2);
         headRig.rotation.x = THREE.MathUtils.lerp(headRig.rotation.x, -0.28, 0.1);
@@ -1783,7 +2255,9 @@ export default function Home() {
           fail();
         }
       } else if (gamePhase === "idle") {
-        runnerVisual.position.y = Math.sin(elapsed * 2.8) * 0.018;
+        // Idle breathing may lift the model slightly, but never sink its soles
+        // through the exact roof plane.
+        runnerVisual.position.y = (Math.sin(elapsed * 2.8) + 1) * 0.004;
         runnerVisual.position.x *= Math.exp(-dt * 10);
         runnerVisual.position.z *= Math.exp(-dt * 10);
         runnerVisual.rotation.x *= Math.exp(-dt * 10);
@@ -1832,7 +2306,6 @@ export default function Home() {
       if (landingSquash > 0 && gamePhase === "idle") {
         const bounce = Math.sin((1 - landingSquash) * Math.PI) * landingSquash;
         runnerVisual.scale.set(1 + bounce * 0.06, 1 - bounce * 0.17, 1 + bounce * 0.06);
-        runnerVisual.position.y -= bounce * 0.055;
         headRig.rotation.x += bounce * 0.11;
         leftArm.rotation.x -= bounce * 0.24;
         rightArm.rotation.x -= bounce * 0.24;
@@ -1915,18 +2388,69 @@ export default function Home() {
       // continuously. Snapping it by one block made the whole skyline jump
       // after every landing.
       city.position.x = focus.x;
-      city.position.y = focus.y * 0.22;
+      const nextRoutePlatform = platforms.find(
+        (platform) => platform.step === currentPlatform.step + 1,
+      );
+      const routeFraction = nextRoutePlatform
+        ? clamp(
+            (runner.position.z - currentPlatform.z) /
+              Math.max(0.001, nextRoutePlatform.z - currentPlatform.z),
+            0,
+            1,
+          )
+        : 0;
+      const altitudeProgress = clamp(
+        (currentPlatform.step + routeFraction) / 24,
+        0,
+        1,
+      );
+      const cityFade = 1 - smoothstep(0.08, 0.62, altitudeProgress);
+      const groundFade = 1 - smoothstep(0.05, 0.42, altitudeProgress);
+      const cloudPass = smoothstep(0.3, 0.47, altitudeProgress) *
+        (1 - smoothstep(0.64, 0.8, altitudeProgress));
+      city.position.y = -altitudeProgress * 1.8;
       city.position.z = focus.z;
+      cityBackdrop.buildingMaterial.opacity = 0.015 + cityFade * 0.255;
+      cityBackdrop.windowMaterial.opacity = 0.012 + cityFade * 0.29;
+      cityBackdrop.beaconMaterial.opacity = 0.01 + cityFade * 0.23;
+      groundReference.groundMaterial.opacity = groundFade * 0.78;
+      groundReference.gridMaterial.opacity = groundFade * 0.2;
+      groundReference.group.visible = groundFade > 0.01;
+      altitudeAtmosphere.passageGroup.position.set(
+        focus.x,
+        focus.y + THREE.MathUtils.lerp(5.6, -4.4, smoothstep(0.26, 0.78, altitudeProgress)),
+        focus.z + 2.8,
+      );
+      altitudeAtmosphere.cloudSeaGroup.position.set(
+        focus.x,
+        focus.y - 3.2 - smoothstep(0.55, 1, altitudeProgress) * 0.7,
+        focus.z + 2.4,
+      );
+      altitudeAtmosphere.passageMaterial.opacity = cloudPass * 0.3;
+      altitudeAtmosphere.cloudSeaMaterial.opacity =
+        0.015 + smoothstep(0.45, 0.82, altitudeProgress) * 0.22;
+      altitudeAtmosphere.passageGroup.visible = cloudPass > 0.01;
+      altitudeAtmosphere.cloudSeaGroup.visible = altitudeProgress > 0.34;
+      sceneFog.color.copy(lowAltitudeFog).lerp(highAltitudeFog, altitudeProgress * 0.72);
+      sceneFog.density = THREE.MathUtils.lerp(0.036, 0.025, altitudeProgress);
 
       const frameElement = mount.parentElement;
       if (frameElement) {
         frameElement.style.setProperty(
-          "--ascent-city",
-          `${clamp(focus.y * 17, 0, 78)}px`,
+          "--ascent-cloud",
+          `${altitudeProgress * 72}px`,
         );
         frameElement.style.setProperty(
-          "--ascent-cloud",
-          `${clamp(focus.y * 8.5, 0, 44)}px`,
+          "--cloud-haze-opacity",
+          String(cloudPass * 0.32),
+        );
+        frameElement.style.setProperty(
+          "--high-air-opacity",
+          String(smoothstep(0.63, 0.92, altitudeProgress) * 0.72),
+        );
+        frameElement.style.setProperty(
+          "--high-sky-opacity",
+          String(smoothstep(0.38, 0.92, altitudeProgress) * 0.72),
         );
       }
 
@@ -1973,11 +2497,9 @@ export default function Home() {
         aria-label="纵跃试玩版"
       >
         <div className="game-mount" ref={mountRef} />
-        <div className="skyline-layer" aria-hidden="true">
-          <span className="skyline-far" />
-          <span className="skyline-near" />
-        </div>
-        <div className="cloud-layer" aria-hidden="true" />
+        <div className="high-sky-shift" aria-hidden="true" />
+        <div className="atmosphere-wash" aria-hidden="true" />
+        <div className="high-air-glint" aria-hidden="true" />
         <div className="top-haze" />
         <div
           className={`ascent-streaks ${phase === "flying" ? "ascent-active" : ""}`}
@@ -2057,7 +2579,7 @@ export default function Home() {
 
         {screen === "game" && (
           <div className="altitude-chip">
-            <span>海拔</span>
+            <span>{altitudeZone}</span>
             <strong>+{String(altitudeMeters).padStart(3, "0")}m</strong>
           </div>
         )}
@@ -2075,32 +2597,71 @@ export default function Home() {
           </div>
         )}
 
-        {screen === "home" && (
-          <div className="menu-screen" aria-label="游戏主页">
-            <div className="menu-kicker">ABOVE THE CITY</div>
-            <div className="menu-title-block">
-              <h2>纵跃</h2>
-              <p>把城市留在脚下，向前跳。</p>
-            </div>
-            <div className="menu-stats" aria-label={`最佳成绩 ${best}`}>
-              <span>最佳高度</span>
+        <div
+          className={`lobby-ui ${screen === "home" ? "lobby-visible" : "lobby-hidden"}`}
+          aria-hidden={screen !== "home"}
+        >
+          <div className="lobby-topbar">
+            <button
+              className="lobby-square-button character-button"
+              type="button"
+              disabled
+              aria-label="角色选择，即将开放"
+            >
+              <span className="character-mini" aria-hidden="true">
+                <i />
+              </span>
+              <span>角色</span>
+              <small>01</small>
+            </button>
+            <button
+              className="lobby-square-button settings-button"
+              type="button"
+              onClick={openSettings}
+              tabIndex={screen === "home" ? 0 : -1}
+              aria-label="打开设置"
+            >
+              <span className="ui-icon ui-icon-settings" aria-hidden="true" />
+              <span>设置</span>
+              <small>天空</small>
+            </button>
+          </div>
+
+          <div className="lobby-brand" aria-label={`纵跃，最佳成绩 ${best}`}>
+            <span>ROOFTOP ASCENT</span>
+            <h2>纵跃</h2>
+            <div>
+              <small>最佳</small>
               <strong>{String(best).padStart(2, "0")}</strong>
             </div>
-            <div className="menu-actions">
-              <button className="primary-button" type="button" onClick={startGame}>
-                开始游戏
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => setScreen("settings")}
-              >
-                设置与背景
-              </button>
-            </div>
-            <span className="menu-footnote">反向拖拽 · 松手起跳</span>
           </div>
-        )}
+
+          <div className="lobby-play-hint" aria-hidden="true">
+            <span className="lobby-touch-dot" />
+            <div>
+              <strong>拖动角色直接开始</strong>
+              <span>向后拉 · 松手起跳</span>
+            </div>
+          </div>
+
+          <nav className="mode-dock" aria-label="玩法选择">
+            <button className="mode-card mode-active" type="button" aria-current="page">
+              <span className="ui-icon ui-icon-ascent" aria-hidden="true" />
+              <strong>攀升</strong>
+              <small>单人无尽</small>
+            </button>
+            <button className="mode-card" type="button" disabled>
+              <span className="ui-icon ui-icon-duel" aria-hidden="true" />
+              <strong>双人</strong>
+              <small>即将开放</small>
+            </button>
+            <button className="mode-card" type="button" disabled>
+              <span className="ui-icon ui-icon-challenge" aria-hidden="true" />
+              <strong>挑战</strong>
+              <small>即将开放</small>
+            </button>
+          </nav>
+        </div>
 
         {screen === "settings" && (
           <div className="settings-screen" aria-label="游戏设置">
@@ -2108,7 +2669,7 @@ export default function Home() {
               <button
                 className="back-button"
                 type="button"
-                onClick={() => setScreen("home")}
+                onClick={closeSettings}
               >
                 返回
               </button>
