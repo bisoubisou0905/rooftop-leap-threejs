@@ -38,6 +38,17 @@ type AppScreen = "home" | "game" | "settings" | "characters";
 type BackgroundTheme = "night" | "dawn" | "violet" | "teal";
 type GameMode = "solo" | "duel";
 type CharacterType = DuelCharacter;
+type GameSound =
+  | "grab"
+  | "charge"
+  | "jump"
+  | "land"
+  | "perfect"
+  | "scrape"
+  | "miss"
+  | "fail"
+  | "splash"
+  | "win";
 
 type Platform = {
   id: number;
@@ -1438,6 +1449,10 @@ export default function Home() {
     let bestValue = Number(window.localStorage.getItem("rooftop-leap-best") || 0);
     let noticeTimer: number | undefined;
     let audioContext: AudioContext | null = null;
+    let audioMaster: GainNode | null = null;
+    let audioCompressor: DynamicsCompressorNode | null = null;
+    let noiseBuffer: AudioBuffer | null = null;
+    const lastSoundAt = new Map<GameSound, number>();
     let activePointer: number | null = null;
     let dragStart = { x: 0, y: 0 };
     let dragCurrent = { x: 0, y: 0 };
@@ -1472,6 +1487,7 @@ export default function Home() {
     let duelFinishedAt: number | null = null;
     let remoteFinishedAt: number | null = null;
     let duelMatchEnded = false;
+    let duelResultSoundPlayed = false;
     let localEliminated = false;
     let remoteEliminated = false;
     let localEliminationReason: DuelEliminationReason | null = null;
@@ -1683,92 +1699,374 @@ export default function Home() {
       return aSampleCrossedThisFrame && bothSolesBelow;
     };
 
-    const ensureAudio = () => {
+    const ensureAudio = (fromUserGesture = false) => {
       if (!soundRef.current) return null;
-      if (!audioContext) audioContext = new AudioContext();
+      if (!audioContext && !fromUserGesture) return null;
+      if (!audioContext) {
+        audioContext = new AudioContext();
+        audioCompressor = audioContext.createDynamicsCompressor();
+        audioCompressor.threshold.value = -22;
+        audioCompressor.knee.value = 18;
+        audioCompressor.ratio.value = 3.2;
+        audioCompressor.attack.value = 0.004;
+        audioCompressor.release.value = 0.16;
+        audioMaster = audioContext.createGain();
+        audioMaster.gain.value = 0.58;
+        audioCompressor.connect(audioMaster).connect(audioContext.destination);
+
+        noiseBuffer = audioContext.createBuffer(
+          1,
+          audioContext.sampleRate,
+          audioContext.sampleRate,
+        );
+        const noise = noiseBuffer.getChannelData(0);
+        let previous = 0;
+        for (let index = 0; index < noise.length; index += 1) {
+          const white = Math.random() * 2 - 1;
+          previous = previous * 0.72 + white * 0.28;
+          noise[index] = previous;
+        }
+      }
       if (audioContext.state === "suspended") void audioContext.resume();
       return audioContext;
     };
 
-    const tone = (
-      startFrequency: number,
-      endFrequency: number,
-      duration: number,
-      volume: number,
-      type: OscillatorType = "sine",
-    ) => {
+    const tone = ({
+      startFrequency,
+      endFrequency,
+      duration,
+      volume,
+      type = "sine",
+      delay = 0,
+      attack = 0.008,
+      release = 0.07,
+      cutoff = 1800,
+      pan = 0,
+      detune = 0,
+    }: {
+      startFrequency: number;
+      endFrequency: number;
+      duration: number;
+      volume: number;
+      type?: OscillatorType;
+      delay?: number;
+      attack?: number;
+      release?: number;
+      cutoff?: number;
+      pan?: number;
+      detune?: number;
+    }) => {
       const context = ensureAudio();
-      if (!context) return;
+      if (!context || !audioCompressor) return;
+      const startedAt = context.currentTime + delay;
+      const endedAt = startedAt + duration;
+      const attackEndsAt = Math.min(endedAt, startedAt + attack);
+      const releaseStartsAt = Math.max(attackEndsAt, endedAt - release);
       const oscillator = context.createOscillator();
+      const filter = context.createBiquadFilter();
+      const panner = context.createStereoPanner();
       const gain = context.createGain();
       oscillator.type = type;
-      oscillator.frequency.setValueAtTime(startFrequency, context.currentTime);
+      oscillator.detune.value = detune;
+      oscillator.frequency.setValueAtTime(startFrequency, startedAt);
       oscillator.frequency.exponentialRampToValueAtTime(
         Math.max(30, endFrequency),
-        context.currentTime + duration,
+        endedAt,
       );
-      gain.gain.setValueAtTime(volume, context.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + duration);
-      oscillator.connect(gain).connect(context.destination);
-      oscillator.start();
-      oscillator.stop(context.currentTime + duration);
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(cutoff, startedAt);
+      filter.Q.value = 0.55;
+      panner.pan.value = pan;
+      gain.gain.setValueAtTime(0.0001, startedAt);
+      gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), attackEndsAt);
+      gain.gain.setValueAtTime(Math.max(0.0002, volume), releaseStartsAt);
+      gain.gain.exponentialRampToValueAtTime(0.0001, endedAt);
+      oscillator.connect(filter).connect(panner).connect(gain).connect(audioCompressor);
+      oscillator.start(startedAt);
+      oscillator.stop(endedAt + 0.01);
     };
 
-    const softNoise = (
-      duration: number,
-      volume: number,
-      cutoff: number,
-    ) => {
+    const softNoise = ({
+      duration,
+      volume,
+      startFrequency,
+      endFrequency = startFrequency,
+      type = "lowpass",
+      delay = 0,
+      attack = 0.004,
+      release = 0.08,
+      q = 0.7,
+      pan = 0,
+    }: {
+      duration: number;
+      volume: number;
+      startFrequency: number;
+      endFrequency?: number;
+      type?: BiquadFilterType;
+      delay?: number;
+      attack?: number;
+      release?: number;
+      q?: number;
+      pan?: number;
+    }) => {
       const context = ensureAudio();
-      if (!context) return;
-      const frameCount = Math.max(1, Math.floor(context.sampleRate * duration));
-      const buffer = context.createBuffer(1, frameCount, context.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let index = 0; index < frameCount; index += 1) {
-        data[index] = Math.random() * 2 - 1;
-      }
+      if (!context || !audioCompressor || !noiseBuffer) return;
+      const startedAt = context.currentTime + delay;
+      const endedAt = startedAt + duration;
+      const attackEndsAt = Math.min(endedAt, startedAt + attack);
+      const releaseStartsAt = Math.max(attackEndsAt, endedAt - release);
       const source = context.createBufferSource();
       const filter = context.createBiquadFilter();
+      const panner = context.createStereoPanner();
       const gain = context.createGain();
-      source.buffer = buffer;
-      filter.type = "lowpass";
-      filter.frequency.setValueAtTime(cutoff, context.currentTime);
-      gain.gain.setValueAtTime(volume, context.currentTime);
-      gain.gain.exponentialRampToValueAtTime(
-        0.0001,
-        context.currentTime + duration,
+      source.buffer = noiseBuffer;
+      source.loop = true;
+      filter.type = type;
+      filter.frequency.setValueAtTime(startFrequency, startedAt);
+      filter.frequency.exponentialRampToValueAtTime(
+        Math.max(30, endFrequency),
+        endedAt,
       );
-      source.connect(filter).connect(gain).connect(context.destination);
-      source.start();
-      source.stop(context.currentTime + duration);
+      filter.Q.value = q;
+      panner.pan.value = pan;
+      gain.gain.setValueAtTime(0.0001, startedAt);
+      gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), attackEndsAt);
+      gain.gain.setValueAtTime(Math.max(0.0002, volume), releaseStartsAt);
+      gain.gain.exponentialRampToValueAtTime(0.0001, endedAt);
+      source.connect(filter).connect(panner).connect(gain).connect(audioCompressor);
+      source.start(startedAt, Math.random() * 0.72);
+      source.stop(endedAt + 0.01);
     };
 
     const playSound = (
-      kind: "grab" | "jump" | "land" | "perfect" | "scrape" | "miss" | "fail",
+      kind: GameSound,
       strength = 0.5,
     ) => {
+      const now = performance.now();
+      const cooldown = kind === "scrape"
+        ? 130
+        : kind === "charge"
+          ? 70
+          : kind === "grab"
+            ? 45
+            : kind === "land" || kind === "jump"
+              ? 85
+              : 180;
+      if (now - (lastSoundAt.get(kind) ?? -Infinity) < cooldown) return;
+      lastSoundAt.set(kind, now);
+      const amount = clamp(strength, 0, 1);
+
       if (kind === "grab") {
-        tone(125, 185, 0.055, 0.009, "sine");
+        tone({
+          startFrequency: 105,
+          endFrequency: 132,
+          duration: 0.075,
+          volume: 0.018,
+          cutoff: 720,
+        });
+        softNoise({
+          duration: 0.045,
+          volume: 0.008,
+          startFrequency: 520,
+          endFrequency: 340,
+          type: "bandpass",
+          release: 0.035,
+        });
+      } else if (kind === "charge") {
+        tone({
+          startFrequency: 245 + amount * 105,
+          endFrequency: 270 + amount * 125,
+          duration: 0.065,
+          volume: 0.012 + amount * 0.004,
+          type: "triangle",
+          attack: 0.004,
+          release: 0.052,
+          cutoff: 950,
+        });
       } else if (kind === "jump") {
-        tone(155, 390 + strength * 190, 0.16, 0.024, "sine");
-        tone(265, 470 + strength * 150, 0.105, 0.009, "triangle");
-        softNoise(0.11, 0.007, 1200);
+        tone({
+          startFrequency: 178 + amount * 34,
+          endFrequency: 112 + amount * 18,
+          duration: 0.19,
+          volume: 0.027,
+          cutoff: 820,
+          release: 0.12,
+        });
+        tone({
+          startFrequency: 238 + amount * 55,
+          endFrequency: 300 + amount * 92,
+          duration: 0.13,
+          volume: 0.009,
+          type: "triangle",
+          attack: 0.012,
+          release: 0.09,
+          cutoff: 1250,
+          detune: -4,
+        });
+        softNoise({
+          duration: 0.17,
+          volume: 0.012,
+          startFrequency: 760 + amount * 240,
+          endFrequency: 1320 + amount * 420,
+          type: "bandpass",
+          attack: 0.018,
+          release: 0.1,
+          q: 0.48,
+        });
       } else if (kind === "land") {
-        tone(145, 92, 0.1, 0.018, "sine");
-        softNoise(0.055, 0.009, 520);
+        tone({
+          startFrequency: 112,
+          endFrequency: 62,
+          duration: 0.14,
+          volume: 0.03,
+          cutoff: 430,
+          attack: 0.003,
+          release: 0.11,
+        });
+        softNoise({
+          duration: 0.075,
+          volume: 0.017,
+          startFrequency: 460,
+          endFrequency: 230,
+          release: 0.06,
+        });
       } else if (kind === "perfect") {
-        tone(420, 720, 0.18, 0.026, "sine");
-        tone(630, 980, 0.2, 0.014, "sine");
-        softNoise(0.045, 0.006, 1400);
+        tone({
+          startFrequency: 392,
+          endFrequency: 404,
+          duration: 0.22,
+          volume: 0.019,
+          type: "triangle",
+          cutoff: 1500,
+          release: 0.17,
+          pan: -0.08,
+        });
+        tone({
+          startFrequency: 523,
+          endFrequency: 538,
+          duration: 0.24,
+          volume: 0.016,
+          type: "sine",
+          delay: 0.055,
+          attack: 0.012,
+          release: 0.18,
+          pan: 0.08,
+        });
+        tone({
+          startFrequency: 105,
+          endFrequency: 64,
+          duration: 0.12,
+          volume: 0.018,
+          cutoff: 420,
+        });
       } else if (kind === "scrape") {
-        tone(120, 70, 0.16, 0.02, "triangle");
-        softNoise(0.12, 0.012, 650);
+        tone({
+          startFrequency: 92,
+          endFrequency: 58,
+          duration: 0.13,
+          volume: 0.018,
+          type: "triangle",
+          cutoff: 360,
+        });
+        softNoise({
+          duration: 0.16,
+          volume: 0.021,
+          startFrequency: 720,
+          endFrequency: 380,
+          type: "bandpass",
+          release: 0.11,
+          q: 0.85,
+          pan: Math.random() * 0.3 - 0.15,
+        });
       } else if (kind === "miss") {
-        tone(110, 55, 0.3, 0.022, "sine");
-        softNoise(0.22, 0.009, 900);
+        tone({
+          startFrequency: 168,
+          endFrequency: 72,
+          duration: 0.32,
+          volume: 0.021,
+          cutoff: 620,
+          attack: 0.018,
+          release: 0.2,
+        });
+        softNoise({
+          duration: 0.3,
+          volume: 0.013,
+          startFrequency: 920,
+          endFrequency: 360,
+          type: "bandpass",
+          attack: 0.025,
+          release: 0.2,
+          q: 0.5,
+        });
+      } else if (kind === "splash") {
+        softNoise({
+          duration: 0.42,
+          volume: 0.034,
+          startFrequency: 860,
+          endFrequency: 210,
+          type: "bandpass",
+          attack: 0.006,
+          release: 0.3,
+          q: 0.55,
+        });
+        tone({
+          startFrequency: 118,
+          endFrequency: 54,
+          duration: 0.3,
+          volume: 0.025,
+          cutoff: 380,
+        });
+        tone({
+          startFrequency: 210,
+          endFrequency: 152,
+          duration: 0.12,
+          volume: 0.007,
+          delay: 0.1,
+          cutoff: 680,
+        });
+      } else if (kind === "win") {
+        [0, 0.075, 0.16].forEach((delay, index) => {
+          const frequencies = [330, 440, 554];
+          tone({
+            startFrequency: frequencies[index],
+            endFrequency: frequencies[index] * 1.015,
+            duration: 0.25,
+            volume: 0.014 + index * 0.002,
+            type: index === 2 ? "sine" : "triangle",
+            delay,
+            attack: 0.012,
+            release: 0.18,
+            cutoff: 1450,
+            pan: (index - 1) * 0.08,
+          });
+        });
       } else {
-        tone(140, 48, 0.48, 0.028, "triangle");
-        softNoise(0.32, 0.01, 700);
+        tone({
+          startFrequency: 126,
+          endFrequency: 46,
+          duration: 0.44,
+          volume: 0.03,
+          type: "triangle",
+          cutoff: 520,
+          attack: 0.01,
+          release: 0.3,
+        });
+        tone({
+          startFrequency: 78,
+          endFrequency: 40,
+          duration: 0.32,
+          volume: 0.017,
+          delay: 0.08,
+          cutoff: 300,
+        });
+        softNoise({
+          duration: 0.3,
+          volume: 0.014,
+          startFrequency: 620,
+          endFrequency: 240,
+          type: "bandpass",
+          release: 0.22,
+        });
       }
     };
 
@@ -1793,6 +2091,16 @@ export default function Home() {
         return;
       }
       const difference = Math.abs(duelFinishedAt - remoteFinishedAt);
+      if (!duelResultSoundPlayed) {
+        duelResultSoundPlayed = true;
+        playSound(
+          difference < 35
+            ? "perfect"
+            : duelFinishedAt < remoteFinishedAt
+              ? "win"
+              : "fail",
+        );
+      }
       if (difference < 35) {
         setDuelResult(`同时抵达 · ${formatDuelTime(duelFinishedAt)}`);
       } else if (duelFinishedAt < remoteFinishedAt) {
@@ -2207,6 +2515,7 @@ export default function Home() {
       duelFinishedAt = null;
       remoteFinishedAt = null;
       duelMatchEnded = false;
+      duelResultSoundPlayed = false;
       localEliminated = false;
       remoteEliminated = false;
       localEliminationReason = null;
@@ -2284,6 +2593,7 @@ export default function Home() {
       } else {
         setDuelResult(`对手${waterReason} · 你获胜`);
         flashNotice("对手出局");
+        playSound("win");
       }
     };
 
@@ -2580,10 +2890,11 @@ export default function Home() {
 
       const nextBand =
         rawDistance < 3 ? 0 : charge >= 0.72 ? 3 : charge >= 0.3 ? 2 : 1;
-      if (nextBand > chargeFeedbackBand && navigator.vibrate) {
-        navigator.vibrate(nextBand === 1 ? 5 : 8);
+      if (nextBand > chargeFeedbackBand) {
+        playSound("charge", nextBand / 3);
+        if (navigator.vibrate) navigator.vibrate(nextBand === 1 ? 5 : 8);
       }
-      chargeFeedbackBand = nextBand;
+      chargeFeedbackBand = Math.max(chargeFeedbackBand, nextBand);
     };
 
     const onPointerDown = (event: PointerEvent) => {
@@ -2618,7 +2929,7 @@ export default function Home() {
       chargeFeedbackBand = 0;
       setChargeLevel(0);
       renderer.domElement.setPointerCapture(event.pointerId);
-      ensureAudio();
+      ensureAudio(true);
       playSound("grab");
       setInternalPhase("charging");
     };
@@ -3043,7 +3354,7 @@ export default function Home() {
         ) {
           cameraKick = Math.max(cameraKick, 0.22);
           spawnMissParticles(currentPlatform, duelWaterLevel + 0.03);
-          playSound("fail");
+          playSound("splash");
           if (navigator.vibrate) navigator.vibrate([55, 35, 100]);
           endDuelByElimination("local", "water");
         }
