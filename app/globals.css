@@ -1391,23 +1391,72 @@ button {
   left: 22px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  color: rgba(170, 228, 228, 0.66);
+  gap: 8px;
+  min-width: 126px;
+  padding: 7px 9px 7px 8px;
+  border: 1px solid rgba(146, 218, 218, 0.11);
+  border-radius: 12px;
+  color: rgba(186, 232, 229, 0.72);
+  background: linear-gradient(105deg, rgba(9, 35, 48, 0.48), rgba(12, 47, 56, 0.25));
+  box-shadow: inset 0 1px 0 rgba(224, 249, 243, 0.035);
   pointer-events: none;
+  backdrop-filter: blur(7px);
+  transition: border-color 220ms ease, color 220ms ease, background 220ms ease;
 }
 
-.duel-water-chip strong {
+.duel-water-copy {
+  display: grid;
+  gap: 5px;
+}
+
+.duel-water-copy strong {
   font-size: 8px;
   font-weight: 750;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.055em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.duel-water-copy > i {
+  width: 82px;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: rgba(103, 185, 191, 0.15);
+}
+
+.duel-water-copy > i > b {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(87, 183, 192, 0.58), rgba(148, 224, 216, 0.88));
+  transform-origin: left;
+  transition: transform 100ms linear;
 }
 
 .water-wave-icon {
-  width: 17px;
-  height: 8px;
+  width: 18px;
+  height: 9px;
   border-top: 2px solid rgba(108, 199, 204, 0.74);
   border-radius: 50%;
   box-shadow: 0 -4px 0 -1px rgba(108, 199, 204, 0.32);
+}
+
+.duel-water-chip.water-danger {
+  border-color: rgba(255, 160, 123, 0.23);
+  color: rgba(255, 211, 185, 0.88);
+  background: linear-gradient(105deg, rgba(43, 37, 42, 0.58), rgba(42, 65, 67, 0.34));
+}
+
+.water-danger .water-wave-icon {
+  border-top-color: rgba(255, 166, 128, 0.88);
+  box-shadow: 0 -4px 0 -1px rgba(255, 166, 128, 0.38);
+  animation: water-alert 900ms ease-in-out infinite;
+}
+
+.water-danger .duel-water-copy > i > b {
+  background: linear-gradient(90deg, rgba(100, 194, 196, 0.65), rgba(255, 151, 111, 0.92));
 }
 
 .duel-lives {
@@ -1517,6 +1566,29 @@ button {
   margin-left: -8px;
   background: #347f84;
   color: rgba(239, 250, 247, 0.9);
+}
+
+.rail-water {
+  position: absolute;
+  left: -5px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  color: rgba(140, 222, 220, 0.82);
+  font-size: 6px;
+  font-weight: 800;
+  text-shadow: 0 2px 7px rgba(4, 24, 34, 0.9);
+  transform: translate(-100%, 50%);
+  transition: bottom 340ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease;
+}
+
+.rail-water i {
+  width: 17px;
+  height: 6px;
+  border-top: 2px solid rgba(104, 208, 210, 0.82);
+  border-radius: 50%;
+  box-shadow: 0 -3px 0 -1px rgba(104, 208, 210, 0.36);
 }
 
 .duel-countdown {
@@ -1917,6 +1989,11 @@ button {
 @keyframes duel-dot {
   0%, 100% { opacity: 0.45; transform: scale(0.85); }
   50% { opacity: 1; transform: scale(1.08); }
+}
+
+@keyframes water-alert {
+  0%, 100% { opacity: 0.68; transform: translateY(1px) scaleX(0.92); }
+  50% { opacity: 1; transform: translateY(-1px) scaleX(1.04); }
 }
 
 @keyframes countdown-pop {

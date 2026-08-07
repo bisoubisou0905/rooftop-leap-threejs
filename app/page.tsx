@@ -18,8 +18,9 @@ import { normalizeDuelRoom } from "./duel-room";
 import {
   consumeDuelLife,
   DUEL_STARTING_LIVES,
+  DUEL_WATER_GRACE_SECONDS,
   DUEL_WATER_START_LEVEL,
-  duelWaterProgressAt,
+  duelWaterTimingAt,
   isPlayerCaughtByWater,
 } from "./duel-rules";
 import type {
@@ -926,16 +927,58 @@ function addDuelFinishGate(platform: Platform, gradientMap: THREE.Texture) {
 
 function createRisingWater(scene: THREE.Scene) {
   const group = new THREE.Group();
-  const waterMaterial = new THREE.MeshBasicMaterial({
-    color: 0x48aebc,
+  const waterMaterial = new THREE.ShaderMaterial({
     transparent: true,
-    opacity: 0.16,
     depthWrite: false,
     side: THREE.DoubleSide,
+    uniforms: {
+      uTime: { value: 0 },
+      uOpacity: { value: 0.2 },
+      uUrgency: { value: 0 },
+    },
+    vertexShader: `
+      uniform float uTime;
+      varying vec2 vUv;
+      varying float vCrest;
+
+      void main() {
+        vUv = uv;
+        vec3 transformed = position;
+        float broadWave = sin(position.x * 0.72 + position.y * 0.19 + uTime * 0.68);
+        float crossWave = sin(position.x * -0.34 + position.y * 0.43 - uTime * 0.48);
+        vCrest = broadWave * 0.58 + crossWave * 0.42;
+        transformed.z += vCrest * 0.022;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uOpacity;
+      uniform float uUrgency;
+      varying vec2 vUv;
+      varying float vCrest;
+
+      void main() {
+        float longBand = sin((vUv.y * 23.0 - uTime * 0.24) + sin(vUv.x * 12.0) * 0.72);
+        float fineBand = sin(vUv.x * 35.0 + vUv.y * 11.0 + uTime * 0.42);
+        float crest = smoothstep(0.58, 0.96, longBand * 0.64 + fineBand * 0.18 + vCrest * 0.32);
+        vec3 deepColor = vec3(0.105, 0.390, 0.440);
+        vec3 surfaceColor = vec3(0.325, 0.690, 0.700);
+        vec3 warningTint = vec3(0.465, 0.790, 0.775);
+        vec3 color = mix(deepColor, surfaceColor, 0.44 + crest * 0.34);
+        color = mix(color, warningTint, uUrgency * 0.22);
+        float alpha = uOpacity * (0.83 + crest * 0.42);
+        gl_FragColor = vec4(color, alpha);
+      }
+    `,
   });
-  const surface = new THREE.Mesh(new THREE.PlaneGeometry(28, 84), waterMaterial);
+  const surface = new THREE.Mesh(
+    new THREE.PlaneGeometry(28, 84, 18, 42),
+    waterMaterial,
+  );
   surface.rotation.x = -Math.PI / 2;
   surface.position.z = 26;
+  surface.renderOrder = 1;
   group.add(surface);
 
   const lineMaterial = new THREE.MeshBasicMaterial({
@@ -1225,7 +1268,11 @@ export default function Home() {
     remote: DUEL_STARTING_LIVES,
   });
   const [duelWaterGap, setDuelWaterGap] = useState(3);
-  const [duelWaterStep, setDuelWaterStep] = useState(0);
+  const [duelWaterStep, setDuelWaterStep] = useState(-1);
+  const [duelWaterNextSeconds, setDuelWaterNextSeconds] = useState(
+    DUEL_WATER_GRACE_SECONDS,
+  );
+  const [duelWaterPhaseProgress, setDuelWaterPhaseProgress] = useState(0);
   const [duelResult, setDuelResult] = useState("");
   const [backgroundTheme, setBackgroundTheme] =
     useState<BackgroundTheme>(() => {
@@ -1309,7 +1356,9 @@ export default function Home() {
     setDuelProgress({ local: 0, remote: 0 });
     setDuelLives({ local: DUEL_STARTING_LIVES, remote: DUEL_STARTING_LIVES });
     setDuelWaterGap(3);
-    setDuelWaterStep(0);
+    setDuelWaterStep(-1);
+    setDuelWaterNextSeconds(DUEL_WATER_GRACE_SECONDS);
+    setDuelWaterPhaseProgress(0);
     setDuelResult("");
     setDuelRematchWaiting(false);
     setDuelRemoteRematchReady(false);
@@ -2174,7 +2223,9 @@ export default function Home() {
       setDuelProgress({ local: 0, remote: 0 });
       setDuelLives({ local: DUEL_STARTING_LIVES, remote: DUEL_STARTING_LIVES });
       setDuelWaterGap(3);
-      setDuelWaterStep(0);
+      setDuelWaterStep(-1);
+      setDuelWaterNextSeconds(DUEL_WATER_GRACE_SECONDS);
+      setDuelWaterPhaseProgress(0);
       setDuelResult("");
       chargeMaterial.opacity = 0;
       tensionLines.visible = false;
@@ -2926,7 +2977,8 @@ export default function Home() {
         };
         const waterElapsed = duelWaterFrozenElapsed ??
           Math.max(0, now - duelRaceStartAt) / 1000;
-        const waterProgress = duelWaterProgressAt(waterElapsed, duelFinishStep);
+        const waterTiming = duelWaterTimingAt(waterElapsed, duelFinishStep);
+        const waterProgress = waterTiming.progress;
         let targetWaterLevel: number;
         if (waterProgress < 0) {
           targetWaterLevel = THREE.MathUtils.lerp(
@@ -2955,15 +3007,26 @@ export default function Home() {
           if (duelFinishedAt === null && !duelMatchEnded) setDuelElapsedMs(raceElapsed);
           const soleHeight = runner.position.y - RUNNER_GROUND_OFFSET;
           setDuelWaterGap(Math.max(0, soleHeight - duelWaterLevel));
-          setDuelWaterStep(Math.floor(Math.max(0, waterProgress)));
+          setDuelWaterStep(waterProgress < 0 ? -1 : Math.floor(waterProgress));
+          setDuelWaterNextSeconds(waterTiming.nextAdvanceIn);
+          setDuelWaterPhaseProgress(waterTiming.phaseProgress);
         }
 
         risingWater.group.position.set(focus.x, duelWaterLevel, focus.z);
-        risingWater.waterMaterial.opacity = 0.14 + Math.sin(elapsed * 0.72) * 0.025;
+        const liveWaterGap = Math.max(
+          0,
+          runner.position.y - RUNNER_GROUND_OFFSET - duelWaterLevel,
+        );
+        const waterUrgency = 1 - THREE.MathUtils.smoothstep(liveWaterGap, 0.42, 2.4);
+        risingWater.waterMaterial.uniforms.uTime.value = elapsed;
+        risingWater.waterMaterial.uniforms.uOpacity.value =
+          0.2 + waterUrgency * 0.09 + Math.sin(elapsed * 0.72) * 0.012;
+        risingWater.waterMaterial.uniforms.uUrgency.value = waterUrgency;
         risingWater.ripples.forEach((ripple, index) => {
           const cycle = (elapsed * (0.18 + index * 0.007) + index * 0.13) % 1;
           ripple.scale.setScalar(0.65 + cycle * 1.25);
-          (ripple.material as THREE.MeshBasicMaterial).opacity = (1 - cycle) * 0.12;
+          (ripple.material as THREE.MeshBasicMaterial).opacity =
+            (1 - cycle) * (0.13 + waterUrgency * 0.08);
         });
 
         if (
@@ -2971,6 +3034,7 @@ export default function Home() {
           duelFinishedAt === null &&
           !duelMatchEnded &&
           !localEliminated &&
+          waterProgress >= 0 &&
           gamePhase !== "failed" &&
           isPlayerCaughtByWater(
             runner.position.y - RUNNER_GROUND_OFFSET,
@@ -3363,13 +3427,23 @@ export default function Home() {
         )}
 
         {screen === "game" && gameMode === "duel" && (
-          <div className="duel-water-chip" aria-label="水面距离">
+          <div
+            className={`duel-water-chip ${duelWaterGap < 0.85 ? "water-danger" : ""}`}
+            aria-label={`水面距离 ${duelWaterGap.toFixed(1)} 米，${Math.ceil(duelWaterNextSeconds)} 秒后推进`}
+          >
             <span className="water-wave-icon" aria-hidden="true" />
-            <strong>
-              {duelWaterGap < 0.65
-                ? "水位逼近"
-                : `已淹 ${duelWaterStep}/18 · ${duelWaterGap.toFixed(1)}m`}
-            </strong>
+            <span className="duel-water-copy">
+              <strong>
+                {duelWaterStep < 0
+                  ? `起点安全 ${Math.max(0, Math.ceil(duelWaterNextSeconds))}s`
+                  : duelWaterGap < 0.85
+                    ? `水面逼近 · ${duelWaterGap.toFixed(1)}m`
+                    : `水面 ${duelWaterStep}/18 · ${duelWaterGap.toFixed(1)}m`}
+              </strong>
+              <i aria-hidden="true">
+                <b style={{ transform: `scaleX(${duelWaterPhaseProgress})` }} />
+              </i>
+            </span>
           </div>
         )}
 
@@ -3408,6 +3482,17 @@ export default function Home() {
               aria-label={`对手在第 ${duelProgress.remote} 段`}
             >
               对
+            </span>
+            <span
+              className="rail-water"
+              style={{
+                bottom: `${8 + (Math.max(0, duelWaterStep) / 18) * 78}%`,
+                opacity: duelWaterStep < 0 ? 0.42 : 1,
+              }}
+              aria-label={duelWaterStep < 0 ? "水面在起点下方" : `水面推进至第 ${duelWaterStep} 段`}
+            >
+              <i />
+              水
             </span>
             <span className="rail-start">起</span>
           </div>
