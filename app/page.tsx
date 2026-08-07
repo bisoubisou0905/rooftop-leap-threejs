@@ -14,6 +14,7 @@ import {
   type SideSweepContact,
   type VerticalCollisionProfile,
 } from "./game-physics";
+import { normalizeDuelRoom } from "./duel-room";
 import type {
   DuelCharacter,
   DuelNetworkController,
@@ -1258,7 +1259,12 @@ export default function Home() {
       ? "heavy"
       : "runner";
   });
+  const [duelRoom] = useState(() => {
+    if (typeof window === "undefined") return normalizeDuelRoom(null);
+    return normalizeDuelRoom(new URLSearchParams(window.location.search).get("room"));
+  });
   const [duelStatus, setDuelStatus] = useState<DuelNetworkStatus | "idle">("idle");
+  const [duelInviteCopied, setDuelInviteCopied] = useState(false);
   const [duelCountdown, setDuelCountdown] = useState(0);
   const [duelElapsedMs, setDuelElapsedMs] = useState(0);
   const [duelProgress, setDuelProgress] = useState({ local: 0, remote: 0 });
@@ -1290,6 +1296,7 @@ export default function Home() {
     if (modeRef.current === "duel") {
       const url = new URL(window.location.href);
       url.searchParams.delete("mode");
+      url.searchParams.delete("room");
       window.history.replaceState(null, "", url);
       modeRef.current = "solo";
       setGameMode("solo");
@@ -1327,8 +1334,13 @@ export default function Home() {
 
   const chooseMode = useCallback((mode: GameMode) => {
     const url = new URL(window.location.href);
-    if (mode === "duel") url.searchParams.set("mode", "duel");
-    else url.searchParams.delete("mode");
+    if (mode === "duel") {
+      url.searchParams.set("mode", "duel");
+      url.searchParams.set("room", duelRoom);
+    } else {
+      url.searchParams.delete("mode");
+      url.searchParams.delete("room");
+    }
     window.history.replaceState(null, "", url);
     modeRef.current = mode;
     setGameMode(mode);
@@ -1340,7 +1352,27 @@ export default function Home() {
     setDuelResult("");
     screenRef.current = "home";
     setScreen("home");
-  }, []);
+  }, [duelRoom]);
+
+  const copyDuelInvite = useCallback(async () => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("mode", "duel");
+    url.searchParams.set("room", duelRoom);
+    try {
+      await navigator.clipboard.writeText(url.toString());
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = url.toString();
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+    }
+    setDuelInviteCopied(true);
+    window.setTimeout(() => setDuelInviteCopied(false), 1800);
+  }, [duelRoom]);
 
   const retry = useCallback(() => {
     restartRef.current();
@@ -2536,7 +2568,7 @@ export default function Home() {
     if (gameMode === "duel") {
       risingWater.group.visible = true;
       void import("./duel-network")
-        .then(({ createDuelNetwork }) => createDuelNetwork(selectedCharacter, {
+        .then(({ createDuelNetwork }) => createDuelNetwork(selectedCharacter, duelRoom, {
           onStatus(status) {
             if (destroyed) return;
             setDuelStatus(status);
@@ -3155,7 +3187,7 @@ export default function Home() {
       if (audioContext) void audioContext.close();
       mount.removeChild(renderer.domElement);
     };
-  }, [gameMode, selectedCharacter]);
+  }, [duelRoom, gameMode, selectedCharacter]);
 
   const duelStatusLabel: Record<DuelNetworkStatus | "idle", string> = {
     idle: "未连接",
@@ -3165,7 +3197,7 @@ export default function Home() {
     connected: "已匹配，准备开始",
     reconnecting: "连接中断，正在恢复",
     full: "当前房间已满",
-    unsupported: "当前浏览器不支持 WebRTC",
+    unsupported: "当前浏览器不支持安全联机",
     error: "连接失败，请刷新重试",
   };
   const duelSeconds = duelElapsedMs / 1000;
@@ -3413,8 +3445,12 @@ export default function Home() {
               <span className="duel-status-dot" />
               <div>
                 <strong>{duelStatusLabel[duelStatus]}</strong>
-                <small>免费 WebRTC 点对点 · 两人自动匹配</small>
+                <small>免费网页中继 · 跨 Wi-Fi / 蜂窝网络</small>
               </div>
+              <span className="duel-room-code">房间 {duelRoom.toUpperCase()}</span>
+              <button type="button" onClick={copyDuelInvite}>
+                {duelInviteCopied ? "已复制" : "复制邀请"}
+              </button>
             </div>
           )}
 

@@ -984,19 +984,21 @@ button {
   position: absolute;
   top: 31%;
   left: 24px;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 4px 10px;
   max-width: calc(100% - 48px);
   padding: 10px 13px;
   border: 1px solid rgba(131, 213, 215, 0.18);
   border-radius: 16px;
   background: rgba(4, 20, 31, 0.43);
-  pointer-events: none;
+  pointer-events: auto;
   backdrop-filter: blur(12px);
 }
 
 .duel-status-dot {
+  grid-row: 1 / span 2;
   width: 8px;
   height: 8px;
   flex: 0 0 auto;
@@ -1032,6 +1034,39 @@ button {
   font-size: 8px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.duel-room-code {
+  grid-column: 2;
+  color: rgba(220, 237, 235, 0.58);
+  font-size: 7px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.duel-lobby-status > button {
+  grid-row: 1 / span 2;
+  grid-column: 3;
+  min-width: 54px;
+  padding: 7px 8px;
+  border: 1px solid rgba(131, 213, 215, 0.23);
+  border-radius: 10px;
+  color: rgba(231, 246, 243, 0.86);
+  background: rgba(116, 201, 199, 0.1);
+  font-size: 8px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+
+.duel-lobby-status > button:hover {
+  border-color: rgba(131, 213, 215, 0.42);
+  background: rgba(116, 201, 199, 0.18);
+}
+
+.duel-lobby-status > button:active {
+  transform: scale(0.96);
 }
 
 .mode-dock {

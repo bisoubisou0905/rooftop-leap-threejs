@@ -1,3 +1,5 @@
+import { makeDuelMatchId, normalizeDuelRoom } from "./duel-room";
+
 export type DuelCharacter = "runner" | "heavy";
 
 export type DuelPose = {
@@ -10,46 +12,78 @@ export type DuelPose = {
   character: DuelCharacter;
 };
 
-type DuelPacket =
-  | { type: "hello"; character: DuelCharacter }
-  | { type: "start"; delayMs: number }
+type LobbyPacket = {
+  version: 3;
+  room: string;
+  from: string;
+  sentAt: number;
+  character: DuelCharacter;
+  type: "hello" | "offer" | "accept" | "start";
+  target?: string;
+  busy?: boolean;
+  matchId?: string;
+  delayMs?: number;
+};
+
+type GamePayload =
+  | { type: "character"; character: DuelCharacter }
   | { type: "pose"; pose: DuelPose }
   | { type: "bump"; id: string; velocity: [number, number, number] }
-  | { type: "finish"; elapsedMs: number }
-  | { type: "full" };
+  | { type: "finish"; elapsedMs: number };
 
-type PeerError = Error & { type?: string };
+type GamePacket = {
+  version: 3;
+  room: string;
+  from: string;
+  target: string;
+  matchId: string;
+} & GamePayload;
 
-type DataConnectionLike = {
-  open: boolean;
-  peer: string;
-  send(data: DuelPacket): void;
-  close(): void;
-  on(event: "open", callback: () => void): void;
-  on(event: "data", callback: (data: unknown) => void): void;
+type MqttMessage = {
+  toString(): string;
+};
+
+type MqttClientLike = {
+  connected: boolean;
+  on(event: "connect", callback: () => void): void;
+  on(event: "reconnect", callback: () => void): void;
   on(event: "close", callback: () => void): void;
+  on(event: "offline", callback: () => void): void;
   on(event: "error", callback: (error: Error) => void): void;
+  on(
+    event: "message",
+    callback: (topic: string, message: MqttMessage) => void,
+  ): void;
+  subscribe(
+    topic: string,
+    options?: { qos?: 0 | 1 },
+    callback?: (error?: Error) => void,
+  ): void;
+  publish(
+    topic: string,
+    payload: string,
+    options?: { qos?: 0 | 1; retain?: boolean },
+  ): void;
+  end(force?: boolean): void;
 };
 
-type PeerLike = {
-  id?: string;
-  destroyed: boolean;
-  connect(id: string, options?: Record<string, unknown>): DataConnectionLike;
-  destroy(): void;
-  on(event: "open", callback: (id: string) => void): void;
-  on(event: "connection", callback: (connection: DataConnectionLike) => void): void;
-  on(event: "error", callback: (error: PeerError) => void): void;
-  on(event: "disconnected", callback: () => void): void;
+type MqttLibrary = {
+  connect(
+    url: string,
+    options: {
+      clientId: string;
+      clean: boolean;
+      connectTimeout: number;
+      reconnectPeriod: number;
+      keepalive: number;
+      protocolVersion: 4;
+    },
+  ): MqttClientLike;
 };
-
-type PeerConstructor = new (
-  id?: string,
-  options?: Record<string, unknown>,
-) => PeerLike;
 
 declare global {
   interface Window {
-    Peer?: PeerConstructor;
+    mqtt?: MqttLibrary;
   }
 }
 
@@ -79,23 +113,42 @@ export type DuelNetworkController = {
   destroy(): void;
 };
 
-const SCRIPT_ID = "rooftop-peerjs-client";
-const SCRIPT_URL = "https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js";
-const LOBBY_ID = "rooftop-leap-public-duel-v1";
+const SCRIPT_ID = "rooftop-mqtt-client";
+const SCRIPT_URL = "https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js";
+const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
+const PROTOCOL_VERSION = 3 as const;
+const START_DELAY_MS = 2400;
+const HEARTBEAT_MS = 1100;
+const REMOTE_TIMEOUT_MS = 7200;
 
-function loadPeerConstructor() {
-  if (window.Peer) return Promise.resolve(window.Peer);
-  return new Promise<PeerConstructor>((resolve, reject) => {
+function createClientId() {
+  const random = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+    : Math.random().toString(36).slice(2, 14);
+  return `rl${random}`;
+}
+
+function loadMqttLibrary() {
+  if (window.mqtt) return Promise.resolve(window.mqtt);
+  return new Promise<MqttLibrary>((resolve, reject) => {
     const existing = document.getElementById(SCRIPT_ID) as HTMLScriptElement | null;
     const script = existing ?? document.createElement("script");
+    const timeout = window.setTimeout(
+      () => reject(new Error("The relay client timed out while loading.")),
+      12000,
+    );
     const finish = () => {
-      if (window.Peer) resolve(window.Peer);
-      else reject(new Error("PeerJS client did not expose a Peer constructor."));
+      window.clearTimeout(timeout);
+      if (window.mqtt) resolve(window.mqtt);
+      else reject(new Error("The relay client did not load correctly."));
     };
     script.addEventListener("load", finish, { once: true });
     script.addEventListener(
       "error",
-      () => reject(new Error("PeerJS client could not be loaded.")),
+      () => {
+        window.clearTimeout(timeout);
+        reject(new Error("The relay client could not be loaded."));
+      },
       { once: true },
     );
     if (!existing) {
@@ -134,155 +187,314 @@ function isPose(value: unknown): value is DuelPose {
     );
 }
 
+function parsePacket(message: MqttMessage) {
+  try {
+    const raw = message.toString();
+    if (raw.length > 24_000) return null;
+    const packet = JSON.parse(raw) as Partial<LobbyPacket | GamePacket>;
+    return packet && typeof packet === "object" ? packet : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function createDuelNetwork(
   character: DuelCharacter,
+  roomValue: string,
   callbacks: DuelNetworkCallbacks,
 ): Promise<DuelNetworkController> {
   callbacks.onStatus("loading");
-  if (!("RTCPeerConnection" in window)) {
+  if (!("WebSocket" in window)) {
     callbacks.onStatus("unsupported");
-    throw new Error("WebRTC is not supported by this browser.");
+    throw new Error("Secure WebSockets are not supported by this browser.");
   }
 
-  const Peer = await loadPeerConstructor();
-  let peer: PeerLike | null = null;
-  let connection: DataConnectionLike | null = null;
+  const mqtt = await loadMqttLibrary();
+  const room = normalizeDuelRoom(roomValue);
+  const localId = createClientId();
+  const baseTopic = `rooftop-leap/v3/${room}`;
+  const lobbyTopic = `${baseTopic}/lobby`;
+  const client = mqtt.connect(BROKER_URL, {
+    clientId: `rooftop_${localId}`,
+    clean: true,
+    connectTimeout: 9000,
+    reconnectPeriod: 1600,
+    keepalive: 20,
+    protocolVersion: 4,
+  });
+
   let destroyed = false;
-  let host = false;
+  let remoteId: string | null = null;
+  let matchId: string | null = null;
+  let matchStarted = false;
+  let remoteLastSeenAt = 0;
+  let lastOfferAt = 0;
   let lastPoseSentAt = 0;
+  let startAt = 0;
   const seenBumps = new Set<string>();
 
-  const send = (packet: DuelPacket) => {
-    if (!destroyed && connection?.open) connection.send(packet);
+  const publish = (
+    topic: string,
+    packet: LobbyPacket | GamePacket,
+    reliable = false,
+  ) => {
+    if (destroyed || !client.connected) return;
+    client.publish(topic, JSON.stringify(packet), {
+      qos: reliable ? 1 : 0,
+      retain: false,
+    });
   };
 
-  const acceptConnection = (candidate: DataConnectionLike) => {
-    if (connection?.open) {
-      candidate.on("open", () => {
-        candidate.send({ type: "full" });
-        candidate.close();
-      });
-      return;
-    }
-    connection = candidate;
-    candidate.on("open", () => {
-      if (destroyed) return;
+  const publishLobby = (
+    packet: Omit<LobbyPacket, "version" | "room" | "from" | "sentAt" | "character">,
+    reliable = false,
+  ) => {
+    publish(lobbyTopic, {
+      version: PROTOCOL_VERSION,
+      room,
+      from: localId,
+      sentAt: Date.now(),
+      character,
+      ...packet,
+    }, reliable);
+  };
+
+  const publishHello = () => {
+    publishLobby({
+      type: "hello",
+      busy: matchStarted,
+      target: remoteId ?? undefined,
+      matchId: matchId ?? undefined,
+    });
+  };
+
+  const resetMatch = (status: DuelNetworkStatus) => {
+    remoteId = null;
+    matchId = null;
+    matchStarted = false;
+    remoteLastSeenAt = 0;
+    lastOfferAt = 0;
+    startAt = 0;
+    if (!destroyed) callbacks.onStatus(status);
+  };
+
+  const sendGamePacket = (
+    packet: GamePayload,
+    reliable = false,
+  ) => {
+    if (!remoteId || !matchId || !matchStarted) return;
+    publish(`${baseTopic}/match/${matchId}`, {
+      version: PROTOCOL_VERSION,
+      room,
+      from: localId,
+      target: remoteId,
+      matchId,
+      ...packet,
+    } as GamePacket, reliable);
+  };
+
+  const startHostMatch = (otherId: string, otherCharacter: DuelCharacter) => {
+    remoteId = otherId;
+    matchId = makeDuelMatchId(localId, otherId);
+    remoteLastSeenAt = Date.now();
+    callbacks.onRemoteCharacter(otherCharacter);
+    if (!matchStarted) {
+      matchStarted = true;
+      startAt = Date.now() + START_DELAY_MS;
       callbacks.onStatus("connected");
-      send({ type: "hello", character });
-      if (host) {
-        const delayMs = 2200;
-        send({ type: "start", delayMs });
-        callbacks.onStart(delayMs, -1);
-      }
-    });
-    candidate.on("data", (raw) => {
-      if (!raw || typeof raw !== "object") return;
-      const packet = raw as Partial<DuelPacket>;
-      if (packet.type === "hello" && isCharacter(packet.character)) {
-        callbacks.onRemoteCharacter(packet.character);
-      } else if (
-        packet.type === "start" &&
-        typeof packet.delayMs === "number" &&
-        Number.isFinite(packet.delayMs)
-      ) {
-        callbacks.onStart(Math.max(600, Math.min(5000, packet.delayMs)), 1);
-      } else if (packet.type === "pose" && isPose(packet.pose)) {
-        callbacks.onPose(packet.pose);
-      } else if (
-        packet.type === "bump" &&
-        typeof packet.id === "string" &&
-        isFiniteTriplet(packet.velocity) &&
-        !seenBumps.has(packet.id)
-      ) {
-        seenBumps.add(packet.id);
-        if (seenBumps.size > 48) seenBumps.delete(seenBumps.values().next().value!);
-        callbacks.onBump(packet.velocity);
-      } else if (
-        packet.type === "finish" &&
-        typeof packet.elapsedMs === "number" &&
-        Number.isFinite(packet.elapsedMs)
-      ) {
-        callbacks.onFinish(Math.max(0, packet.elapsedMs));
-      } else if (packet.type === "full") {
-        callbacks.onStatus("full");
-      }
-    });
-    candidate.on("close", () => {
-      if (!destroyed) callbacks.onStatus("reconnecting");
-    });
-    candidate.on("error", () => {
-      if (!destroyed) callbacks.onStatus("error");
-    });
+      callbacks.onStart(START_DELAY_MS, -1);
+      sendGamePacket({ type: "character", character }, true);
+    }
+    publishLobby({
+      type: "start",
+      target: otherId,
+      matchId,
+      delayMs: Math.max(600, startAt - Date.now()),
+    }, true);
   };
 
-  const joinLobby = () => {
-    if (destroyed) return;
-    callbacks.onStatus("joining");
-    peer = new Peer();
-    peer.on("open", () => {
-      if (destroyed || !peer) return;
-      acceptConnection(
-        peer.connect(LOBBY_ID, {
-          label: "rooftop-duel",
-          serialization: "json",
-          reliable: false,
-          metadata: { game: "rooftop-leap", version: 1 },
-        }),
-      );
-    });
-    peer.on("error", (error) => {
-      if (destroyed) return;
-      callbacks.onStatus(error.type === "peer-unavailable" ? "reconnecting" : "error");
-    });
-    peer.on("disconnected", () => {
-      if (!destroyed && !connection?.open) callbacks.onStatus("reconnecting");
-    });
+  const startGuestMatch = (
+    otherId: string,
+    otherCharacter: DuelCharacter,
+    proposedMatchId: string,
+    delayMs: number,
+  ) => {
+    const expectedMatchId = makeDuelMatchId(localId, otherId);
+    if (proposedMatchId !== expectedMatchId) return;
+    remoteId = otherId;
+    matchId = expectedMatchId;
+    remoteLastSeenAt = Date.now();
+    callbacks.onRemoteCharacter(otherCharacter);
+    if (matchStarted) return;
+    matchStarted = true;
+    callbacks.onStatus("connected");
+    callbacks.onStart(Math.max(600, Math.min(5000, delayMs)), 1);
+    sendGamePacket({ type: "character", character }, true);
   };
 
-  callbacks.onStatus("hosting");
-  host = true;
-  peer = new Peer(LOBBY_ID);
-  peer.on("open", () => {
-    if (!destroyed) callbacks.onStatus("hosting");
-  });
-  peer.on("connection", acceptConnection);
-  peer.on("error", (error) => {
-    if (destroyed) return;
-    if (error.type === "unavailable-id") {
-      host = false;
-      peer?.destroy();
-      joinLobby();
+  const handleLobbyPacket = (packet: Partial<LobbyPacket>) => {
+    if (
+      packet.version !== PROTOCOL_VERSION ||
+      packet.room !== room ||
+      typeof packet.from !== "string" ||
+      packet.from === localId ||
+      !isCharacter(packet.character) ||
+      typeof packet.sentAt !== "number" ||
+      Math.abs(Date.now() - packet.sentAt) > 15_000
+    ) return;
+
+    if (packet.from === remoteId) remoteLastSeenAt = Date.now();
+
+    if (packet.type === "hello") {
+      if (packet.from === remoteId) return;
+      if (packet.busy || remoteId || localId > packet.from) return;
+      const now = Date.now();
+      if (now - lastOfferAt < 850) return;
+      lastOfferAt = now;
+      callbacks.onStatus("joining");
+      publishLobby({ type: "offer", target: packet.from }, true);
       return;
     }
-    callbacks.onStatus("error");
+
+    if (packet.target !== localId) return;
+
+    if (packet.type === "offer") {
+      if (packet.from > localId || (remoteId && remoteId !== packet.from)) return;
+      remoteId = packet.from;
+      matchId = makeDuelMatchId(localId, packet.from);
+      remoteLastSeenAt = Date.now();
+      callbacks.onRemoteCharacter(packet.character);
+      callbacks.onStatus("joining");
+      publishLobby({
+        type: "accept",
+        target: packet.from,
+        matchId,
+      }, true);
+      return;
+    }
+
+    if (packet.type === "accept") {
+      if (localId > packet.from || (remoteId && remoteId !== packet.from)) return;
+      if (packet.matchId !== makeDuelMatchId(localId, packet.from)) return;
+      startHostMatch(packet.from, packet.character);
+      return;
+    }
+
+    if (
+      packet.type === "start" &&
+      typeof packet.matchId === "string" &&
+      typeof packet.delayMs === "number" &&
+      Number.isFinite(packet.delayMs) &&
+      (!remoteId || remoteId === packet.from)
+    ) {
+      startGuestMatch(packet.from, packet.character, packet.matchId, packet.delayMs);
+    }
+  };
+
+  const handleGamePacket = (packet: Partial<GamePacket>) => {
+    if (
+      !matchStarted ||
+      !remoteId ||
+      !matchId ||
+      packet.version !== PROTOCOL_VERSION ||
+      packet.room !== room ||
+      packet.from !== remoteId ||
+      packet.target !== localId ||
+      packet.matchId !== matchId
+    ) return;
+    remoteLastSeenAt = Date.now();
+
+    if (packet.type === "character" && isCharacter(packet.character)) {
+      callbacks.onRemoteCharacter(packet.character);
+    } else if (packet.type === "pose" && isPose(packet.pose)) {
+      callbacks.onPose(packet.pose);
+    } else if (
+      packet.type === "bump" &&
+      typeof packet.id === "string" &&
+      isFiniteTriplet(packet.velocity) &&
+      !seenBumps.has(packet.id)
+    ) {
+      seenBumps.add(packet.id);
+      if (seenBumps.size > 48) seenBumps.delete(seenBumps.values().next().value!);
+      callbacks.onBump(packet.velocity);
+    } else if (
+      packet.type === "finish" &&
+      typeof packet.elapsedMs === "number" &&
+      Number.isFinite(packet.elapsedMs)
+    ) {
+      callbacks.onFinish(Math.max(0, packet.elapsedMs));
+    }
+  };
+
+  client.on("connect", () => {
+    if (destroyed) return;
+    client.subscribe(`${baseTopic}/#`, { qos: 1 }, (error) => {
+      if (destroyed) return;
+      if (error) {
+        callbacks.onStatus("error");
+        return;
+      }
+      resetMatch("hosting");
+      publishHello();
+    });
   });
-  peer.on("disconnected", () => {
-    if (!destroyed && !connection?.open) callbacks.onStatus("reconnecting");
+  client.on("reconnect", () => {
+    if (!destroyed) callbacks.onStatus("reconnecting");
   });
+  client.on("offline", () => {
+    if (!destroyed) callbacks.onStatus("reconnecting");
+  });
+  client.on("close", () => {
+    if (!destroyed) resetMatch("reconnecting");
+  });
+  client.on("error", () => {
+    if (!destroyed) callbacks.onStatus(client.connected ? "reconnecting" : "error");
+  });
+  client.on("message", (topic, message) => {
+    if (destroyed || !topic.startsWith(`${baseTopic}/`)) return;
+    const packet = parsePacket(message);
+    if (!packet) return;
+    if (topic === lobbyTopic) handleLobbyPacket(packet as Partial<LobbyPacket>);
+    else if (topic.includes("/match/")) handleGamePacket(packet as Partial<GamePacket>);
+  });
+
+  const heartbeatTimer = window.setInterval(() => {
+    if (client.connected) publishHello();
+  }, HEARTBEAT_MS);
+  const watchdogTimer = window.setInterval(() => {
+    if (
+      !destroyed &&
+      remoteId &&
+      remoteLastSeenAt > 0 &&
+      Date.now() - remoteLastSeenAt > REMOTE_TIMEOUT_MS
+    ) {
+      resetMatch("reconnecting");
+      publishHello();
+    }
+  }, 1300);
 
   return {
     sendPose(pose) {
       const now = performance.now();
-      if (now - lastPoseSentAt < 66) return;
+      if (now - lastPoseSentAt < 80) return;
       lastPoseSentAt = now;
-      send({ type: "pose", pose });
+      sendGamePacket({ type: "pose", pose });
     },
     sendBump(velocity) {
-      send({
+      sendGamePacket({
         type: "bump",
-        id: `${peer?.id ?? "peer"}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        id: `${localId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         velocity,
-      });
+      }, true);
     },
     sendFinish(elapsedMs) {
-      send({ type: "finish", elapsedMs });
+      sendGamePacket({ type: "finish", elapsedMs }, true);
     },
     destroy() {
       destroyed = true;
-      connection?.close();
-      peer?.destroy();
-      connection = null;
-      peer = null;
+      window.clearInterval(heartbeatTimer);
+      window.clearInterval(watchdogTimer);
+      client.end(true);
     },
   };
 }
