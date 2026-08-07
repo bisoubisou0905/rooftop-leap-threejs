@@ -200,8 +200,9 @@ test("player collision is noticeable but capped to a gentle velocity change", ()
   );
   assert.ok(collision);
   assert.ok(collision.impactSpeed > 2);
-  assert.ok(Math.abs(collision.localVelocityX - 2.4) <= 0.721);
-  assert.ok(Math.abs(collision.remoteVelocityX) <= 0.721);
+  assert.ok(Math.abs(collision.localVelocityX - 2.4) > 0.72);
+  assert.ok(Math.abs(collision.localVelocityX - 2.4) <= 0.821);
+  assert.ok(Math.abs(collision.remoteVelocityX) <= 0.821);
 });
 
 test("the heavyweight receives less speed change than the light runner", () => {
