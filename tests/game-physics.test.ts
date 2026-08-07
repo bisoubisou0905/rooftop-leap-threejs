@@ -5,6 +5,7 @@ import {
   dragDistanceToCharge,
   footSweepContact,
   pointOnPlatformSurface,
+  resolveWeightedPlayerCollision,
   sweepBodyAgainstProfile,
   type FootSweepPoint,
   type PlatformSurface,
@@ -190,4 +191,28 @@ test("the drag curve preserves tiny hops without making mid-range input jumpy", 
   assert.ok(tinyLaunch.lift < 2);
   assert.ok(fullLaunch.speed > 6);
   assert.ok(fullLaunch.lift > 6);
+});
+
+test("player collision is noticeable but capped to a gentle velocity change", () => {
+  const collision = resolveWeightedPlayerCollision(
+    { x: 0, z: 0, velocityX: 2.4, velocityZ: 0, radius: 0.28, mass: 1 },
+    { x: 0.5, z: 0, velocityX: 0, velocityZ: 0, radius: 0.3, mass: 1 },
+  );
+  assert.ok(collision);
+  assert.ok(collision.impactSpeed > 2);
+  assert.ok(Math.abs(collision.localVelocityX - 2.4) <= 0.721);
+  assert.ok(Math.abs(collision.remoteVelocityX) <= 0.721);
+});
+
+test("the heavyweight receives less speed change than the light runner", () => {
+  const collision = resolveWeightedPlayerCollision(
+    { x: 0, z: 0, velocityX: 1.2, velocityZ: 0, radius: 0.34, mass: 1.65 },
+    { x: 0.58, z: 0, velocityX: -1.2, velocityZ: 0, radius: 0.28, mass: 1 },
+  );
+  assert.ok(collision);
+  const heavyChange = Math.abs(collision.localVelocityX - 1.2);
+  const lightChange = Math.abs(collision.remoteVelocityX + 1.2);
+  assert.ok(heavyChange < lightChange);
+  assert.ok(collision.localPositionX < 0);
+  assert.ok(collision.remotePositionX > 0.58);
 });
