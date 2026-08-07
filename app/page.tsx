@@ -858,6 +858,8 @@ export default function Home() {
   const [phase, setPhase] = useState<GamePhase>("idle");
   const [notice, setNotice] = useState("");
   const [hasJumped, setHasJumped] = useState(false);
+  const [chargeLevel, setChargeLevel] = useState(0);
+  const [altitudeMeters, setAltitudeMeters] = useState(0);
   const [soundOn, setSoundOn] = useState(true);
   const [screen, setScreen] = useState<AppScreen>("home");
   const [backgroundTheme, setBackgroundTheme] =
@@ -914,7 +916,10 @@ export default function Home() {
     let activePointer: number | null = null;
     let dragStart = { x: 0, y: 0 };
     let dragCurrent = { x: 0, y: 0 };
+    let dragDistance = 0;
     let charge = 0;
+    let launchCharge = 0;
+    let chargeFeedbackBand = 0;
     let targetDirection = new THREE.Vector3(0, 0, 1);
     let launchPlatformId = 0;
     let platforms: Platform[] = [];
@@ -992,6 +997,22 @@ export default function Home() {
     const runnerVisual = runner.getObjectByName("runner-visual") as THREE.Group;
     const chargeGlow = runner.getObjectByName("charge-glow") as THREE.Mesh;
     const chargeMaterial = chargeGlow.material as THREE.MeshBasicMaterial;
+    const tensionGeometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-0.13, 0.07, 0),
+      new THREE.Vector3(-0.13, 0.07, 0),
+      new THREE.Vector3(0.13, 0.07, 0),
+      new THREE.Vector3(0.13, 0.07, 0),
+    ]);
+    const tensionMaterial = new THREE.LineBasicMaterial({
+      color: 0xffc08b,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    const tensionLines = new THREE.LineSegments(tensionGeometry, tensionMaterial);
+    tensionLines.visible = false;
+    tensionLines.renderOrder = 5;
+    runner.add(tensionLines);
     const leftArm = runnerVisual.getObjectByName("left-arm") as THREE.Group;
     const rightArm = runnerVisual.getObjectByName("right-arm") as THREE.Group;
     const leftForearm = runnerVisual.getObjectByName("left-forearm") as THREE.Group;
@@ -1142,11 +1163,15 @@ export default function Home() {
           2.05,
         );
       }
-      const topY = clamp(
-        from.topY + (seededNoise(id + 60) - 0.5) * 0.34,
-        -0.36,
-        0.52,
-      );
+      // Every roof is a small but real step upward. The camera follows this
+      // world-space rise, so the skyline and cloud deck sink below the player
+      // instead of the route feeling like a flat conveyor belt.
+      const rise =
+        0.09 +
+        seededNoise(id + 60) * 0.115 +
+        difficulty * 0.025 +
+        (id % 7 === 0 ? 0.035 : 0);
+      const topY = from.topY + rise;
       return createPlatform(
         { id, x, z, topY, width, depth, shape },
         scene,
@@ -1255,7 +1280,11 @@ export default function Home() {
       );
       desiredFocus.set(
         THREE.MathUtils.lerp(currentPlatform.x, routeX, 0.38),
-        0,
+        currentPlatform.topY * 0.55 +
+          next.topY * 0.28 +
+          second.topY * 0.12 +
+          third.topY * 0.05 -
+          0.05,
         currentPlatform.z + cameraLookAhead,
       );
       if (snap) focus.copy(desiredFocus);
@@ -1293,6 +1322,8 @@ export default function Home() {
       resetPlatforms();
       scoreValue = 0;
       setScore(0);
+      setAltitudeMeters(0);
+      setChargeLevel(0);
       setNotice("");
       runner.position.set(currentPlatform.x, currentPlatform.topY + 0.01, currentPlatform.z);
       runner.rotation.set(0, 0, 0);
@@ -1319,10 +1350,15 @@ export default function Home() {
       velocity.set(0, 0, 0);
       launchPlatformId = currentPlatform.id;
       charge = 0;
+      launchCharge = 0;
+      dragDistance = 0;
+      chargeFeedbackBand = 0;
       fallElapsed = 0;
       fallPlatform = null;
       fallHasWallContact = false;
       chargeMaterial.opacity = 0;
+      tensionLines.visible = false;
+      tensionMaterial.opacity = 0;
       updatePathFocus(true);
       setInternalPhase("idle");
     };
@@ -1401,7 +1437,8 @@ export default function Home() {
       fallPlatform = null;
       landingSquash = 0.62;
       cameraKick = 0.08;
-      flashNotice("差一点，再来");
+      setChargeLevel(0);
+      flashNotice(launchCharge < 0.16 ? "轻跳" : "差一点，再来");
       playSound("land");
       setInternalPhase("idle");
     };
@@ -1417,6 +1454,7 @@ export default function Home() {
       const perfect = normalizedDistance < 0.24;
       scoreValue += perfect ? 2 : 1;
       setScore(scoreValue);
+      setAltitudeMeters(Math.round(platform.id * 5.5 + platform.topY * 4));
       bestValue = Math.max(bestValue, scoreValue);
       setBest(bestValue);
       window.localStorage.setItem("rooftop-leap-best", String(bestValue));
@@ -1442,25 +1480,37 @@ export default function Home() {
     };
 
     const startJump = () => {
-      if (charge < 0.025) {
+      if (dragDistance < 3) {
         charge = 0;
+        launchCharge = 0;
         chargeMaterial.opacity = 0;
+        tensionLines.visible = false;
+        tensionMaterial.opacity = 0;
         runnerVisual.scale.set(1, 1, 1);
-        runnerVisual.position.z = 0;
+        runnerVisual.position.set(0, 0, 0);
+        setChargeLevel(0);
         setInternalPhase("idle");
         return;
       }
-      const speed = 2.85 + charge * 3.45;
-      const lift = 4.65 + charge * 1.35;
+      const effectiveCharge = Math.max(0.012, charge);
+      // The old minimum velocity was already a medium jump. These curves keep
+      // the full-distance range while giving the first few pixels of drag a
+      // genuinely tiny, nearly in-place hop.
+      const speed = 0.22 + Math.pow(effectiveCharge, 0.78) * 6.12;
+      const lift = 2.45 + Math.pow(effectiveCharge, 0.55) * 3.55;
       velocity.set(targetDirection.x * speed, lift, targetDirection.z * speed);
+      launchCharge = effectiveCharge;
       fallPlatform = null;
       launchPlatformId = currentPlatform.id;
       setInternalPhase("flying");
       setHasJumped(true);
       chargeMaterial.opacity = 0;
+      tensionLines.visible = false;
+      tensionMaterial.opacity = 0;
       runnerVisual.scale.set(1, 1, 1);
-      runnerVisual.position.z = 0;
-      playSound("jump", charge);
+      runnerVisual.position.set(0, 0, 0);
+      setChargeLevel(0);
+      playSound("jump", effectiveCharge);
     };
 
     const updateCharge = () => {
@@ -1472,29 +1522,66 @@ export default function Home() {
       const rawDistance = Math.sqrt(
         pullX * pullX + actualPullForward * actualPullForward,
       );
-      const linearCharge = clamp((rawDistance - 18) / 170, 0, 1);
-      const easedCharge =
-        linearCharge * linearCharge * (3 - 2 * linearCharge);
-      charge = Math.pow(easedCharge, 1.15);
+      dragDistance = rawDistance;
+      const linearCharge = clamp(rawDistance / 182, 0, 1);
+      charge = Math.pow(linearCharge, 1.08);
+      const touchIntent = clamp(rawDistance / 12, 0, 1);
+      const poseAmount = Math.max(charge, touchIntent * 0.1);
       targetDirection.set(pullX * 0.66, 0, pullForward).normalize();
       runner.rotation.y = Math.atan2(targetDirection.x, targetDirection.z);
-      runnerVisual.scale.set(1 + charge * 0.035, 1 - charge * 0.17, 1 + charge * 0.035);
-      runnerVisual.position.z = -charge * 0.14;
-      runnerVisual.rotation.x = charge * 0.16;
-      runnerVisual.rotation.z = -targetDirection.x * charge * 0.11;
-      headRig.rotation.x = -charge * 0.1;
-      headRig.rotation.z = targetDirection.x * charge * 0.08;
-      leftArm.rotation.x = -charge * 0.56;
-      rightArm.rotation.x = -charge * 0.56;
-      leftForearm.rotation.x = charge * 0.48;
-      rightForearm.rotation.x = charge * 0.48;
-      leftLeg.rotation.z = -charge * 0.18;
-      rightLeg.rotation.z = charge * 0.18;
-      leftCalf.rotation.x = charge * 0.24;
-      rightCalf.rotation.x = charge * 0.24;
-      chargeMaterial.opacity = 0.12 + charge * 0.42;
-      chargeGlow.scale.set(0.82 + charge * 0.34, 1 + charge * 1.3, 1);
-      chargeGlow.position.z = charge * 0.18;
+      runnerVisual.scale.set(
+        1 + poseAmount * 0.055,
+        1 - poseAmount * 0.24,
+        1 + poseAmount * 0.055,
+      );
+      runnerVisual.position.x = -targetDirection.x * poseAmount * 0.24;
+      runnerVisual.position.y = -poseAmount * 0.065;
+      runnerVisual.position.z = -targetDirection.z * poseAmount * 0.26;
+      runnerVisual.rotation.x = poseAmount * 0.23;
+      runnerVisual.rotation.z = -targetDirection.x * poseAmount * 0.17;
+      headRig.rotation.x = -poseAmount * 0.14;
+      headRig.rotation.z = targetDirection.x * poseAmount * 0.11;
+      leftArm.rotation.x = -poseAmount * 0.72;
+      rightArm.rotation.x = -poseAmount * 0.72;
+      leftForearm.rotation.x = poseAmount * 0.58;
+      rightForearm.rotation.x = poseAmount * 0.58;
+      leftLeg.rotation.z = -poseAmount * 0.24;
+      rightLeg.rotation.z = poseAmount * 0.24;
+      leftCalf.rotation.x = poseAmount * 0.34;
+      rightCalf.rotation.x = poseAmount * 0.34;
+      chargeMaterial.opacity = touchIntent * 0.16 + charge * 0.5;
+      chargeGlow.scale.set(0.8 + charge * 0.48, 1 + charge * 1.6, 1);
+      chargeGlow.position.x = runnerVisual.position.x * 0.38;
+      chargeGlow.position.z = -0.02 + charge * 0.24;
+
+      const tensionPositions = tensionGeometry.getAttribute(
+        "position",
+      ) as THREE.BufferAttribute;
+      tensionPositions.setXYZ(0, -0.13, 0.07, 0);
+      tensionPositions.setXYZ(
+        1,
+        -0.13 + runnerVisual.position.x,
+        0.07 + runnerVisual.position.y,
+        runnerVisual.position.z,
+      );
+      tensionPositions.setXYZ(2, 0.13, 0.07, 0);
+      tensionPositions.setXYZ(
+        3,
+        0.13 + runnerVisual.position.x,
+        0.07 + runnerVisual.position.y,
+        runnerVisual.position.z,
+      );
+      tensionPositions.needsUpdate = true;
+      tensionLines.visible = rawDistance >= 3;
+      tensionMaterial.opacity = touchIntent * (0.28 + charge * 0.64);
+      setChargeLevel(Math.max(charge, touchIntent * 0.035));
+
+      const nextBand =
+        rawDistance < 3 ? 0 : charge >= 0.72 ? 3 : charge >= 0.3 ? 2 : 1;
+      if (nextBand > chargeFeedbackBand && navigator.vibrate) {
+        navigator.vibrate(nextBand === 1 ? 5 : 8);
+      }
+      chargeFeedbackBand = nextBand;
     };
 
     const onPointerDown = (event: PointerEvent) => {
@@ -1503,6 +1590,10 @@ export default function Home() {
       activePointer = event.pointerId;
       dragStart = { x: event.clientX, y: event.clientY };
       dragCurrent = { ...dragStart };
+      dragDistance = 0;
+      charge = 0;
+      chargeFeedbackBand = 0;
+      setChargeLevel(0);
       renderer.domElement.setPointerCapture(event.pointerId);
       ensureAudio();
       playSound("grab");
@@ -1693,6 +1784,7 @@ export default function Home() {
         }
       } else if (gamePhase === "idle") {
         runnerVisual.position.y = Math.sin(elapsed * 2.8) * 0.018;
+        runnerVisual.position.x *= Math.exp(-dt * 10);
         runnerVisual.position.z *= Math.exp(-dt * 10);
         runnerVisual.rotation.x *= Math.exp(-dt * 10);
         runnerVisual.rotation.z *= Math.exp(-dt * 10);
@@ -1809,17 +1901,34 @@ export default function Home() {
       focus.lerp(desiredFocus, followSpeed);
       cameraKick = Math.max(0, cameraKick - dt * 2.3);
       const kick = Math.sin(elapsed * 44) * cameraKick;
-      camera.position.set(focus.x + kick * 0.1, 8.9 + kick * 0.055, focus.z - 7.1);
-      camera.lookAt(focus.x, -0.1, focus.z + 2.15);
-      sun.position.set(focus.x - 5, 12, focus.z - 5);
-      sunTarget.position.set(focus.x, 0, focus.z + 2.2);
-      rimLight.position.set(focus.x + 2, 4.5, focus.z + 1.5);
-      coolRim.position.set(focus.x - 2.4, 3.8, focus.z + 3.2);
+      camera.position.set(
+        focus.x + kick * 0.1,
+        focus.y + 8.9 + kick * 0.055,
+        focus.z - 7.1,
+      );
+      camera.lookAt(focus.x, focus.y - 0.1, focus.z + 2.15);
+      sun.position.set(focus.x - 5, focus.y + 12, focus.z - 5);
+      sunTarget.position.set(focus.x, focus.y, focus.z + 2.2);
+      rimLight.position.set(focus.x + 2, focus.y + 4.5, focus.z + 1.5);
+      coolRim.position.set(focus.x - 2.4, focus.y + 3.8, focus.z + 3.2);
       // The city is an atmospheric backdrop, so it follows the camera
       // continuously. Snapping it by one block made the whole skyline jump
       // after every landing.
       city.position.x = focus.x;
+      city.position.y = focus.y * 0.22;
       city.position.z = focus.z;
+
+      const frameElement = mount.parentElement;
+      if (frameElement) {
+        frameElement.style.setProperty(
+          "--ascent-city",
+          `${clamp(focus.y * 17, 0, 78)}px`,
+        );
+        frameElement.style.setProperty(
+          "--ascent-cloud",
+          `${clamp(focus.y * 8.5, 0, 44)}px`,
+        );
+      }
 
       renderer.render(scene, camera);
     };
@@ -1870,6 +1979,10 @@ export default function Home() {
         </div>
         <div className="cloud-layer" aria-hidden="true" />
         <div className="top-haze" />
+        <div
+          className={`ascent-streaks ${phase === "flying" ? "ascent-active" : ""}`}
+          aria-hidden="true"
+        />
 
         {screen === "game" && (
           <header className="hud">
@@ -1878,7 +1991,7 @@ export default function Home() {
               <span className="hud-sub">ROOFTOP RUN</span>
             </div>
             <div className="score-block" aria-label={`当前分数 ${score}`}>
-              <span className="score-label">高度</span>
+              <span className="score-label">进度</span>
               <strong>{String(score).padStart(2, "0")}</strong>
             </div>
             <div className="hud-actions">
@@ -1908,7 +2021,7 @@ export default function Home() {
 
         {screen === "game" && (
           <div
-            className={`gesture-hint ${!hasJumped && phase !== "failed" ? "hint-visible" : ""}`}
+            className={`gesture-hint ${!hasJumped && phase === "idle" ? "hint-visible" : ""}`}
           >
             <span className="gesture-dot" />
             <div>
@@ -1919,7 +2032,34 @@ export default function Home() {
         )}
 
         {screen === "game" && (
+          <div
+            className={`charge-feedback ${phase === "charging" ? "charge-visible" : ""}`}
+            aria-hidden="true"
+          >
+            <span className="charge-state">
+              {chargeLevel < 0.01
+                ? "拖动角色"
+                : chargeLevel < 0.16
+                  ? "短跳"
+                  : chargeLevel < 0.62
+                    ? "蓄力"
+                    : "远跃"}
+            </span>
+            <span className="charge-track">
+              <span style={{ transform: `scaleX(${chargeLevel})` }} />
+            </span>
+          </div>
+        )}
+
+        {screen === "game" && (
           <div className="best-chip">最佳 {String(best).padStart(2, "0")}</div>
+        )}
+
+        {screen === "game" && (
+          <div className="altitude-chip">
+            <span>海拔</span>
+            <strong>+{String(altitudeMeters).padStart(3, "0")}m</strong>
+          </div>
         )}
 
         {screen === "game" && phase === "failed" && (
