@@ -40,6 +40,30 @@ export type FootSweepContact = {
   soleCenterZ: number;
 };
 
+export type PlayerCollisionBody = {
+  x: number;
+  z: number;
+  velocityX: number;
+  velocityZ: number;
+  radius: number;
+  mass: number;
+};
+
+export type PlayerCollisionResult = {
+  normalX: number;
+  normalZ: number;
+  overlap: number;
+  localPositionX: number;
+  localPositionZ: number;
+  remotePositionX: number;
+  remotePositionZ: number;
+  localVelocityX: number;
+  localVelocityZ: number;
+  remoteVelocityX: number;
+  remoteVelocityZ: number;
+  impactSpeed: number;
+};
+
 function clamp01(value: number) {
   return Math.min(1, Math.max(0, value));
 }
@@ -47,6 +71,66 @@ function clamp01(value: number) {
 export function dragDistanceToCharge(distance: number) {
   const linearCharge = clamp01((distance - 2.5) / 193.5);
   return Math.pow(linearCharge, 1.25);
+}
+
+export function resolveWeightedPlayerCollision(
+  local: PlayerCollisionBody,
+  remote: PlayerCollisionBody,
+  restitution = 0.08,
+  maxVelocityChange = 0.72,
+): PlayerCollisionResult | null {
+  const deltaX = local.x - remote.x;
+  const deltaZ = local.z - remote.z;
+  const minimumDistance = local.radius + remote.radius;
+  const distance = Math.hypot(deltaX, deltaZ);
+  if (distance >= minimumDistance) return null;
+
+  let normalX = distance > 1e-5 ? deltaX / distance : 1;
+  let normalZ = distance > 1e-5 ? deltaZ / distance : 0;
+  if (!Number.isFinite(normalX + normalZ)) {
+    normalX = 1;
+    normalZ = 0;
+  }
+
+  const localMass = Math.max(0.1, local.mass);
+  const remoteMass = Math.max(0.1, remote.mass);
+  const inverseLocalMass = 1 / localMass;
+  const inverseRemoteMass = 1 / remoteMass;
+  const inverseMassTotal = inverseLocalMass + inverseRemoteMass;
+  const relativeNormalSpeed =
+    (local.velocityX - remote.velocityX) * normalX +
+    (local.velocityZ - remote.velocityZ) * normalZ;
+  const impactSpeed = Math.max(0, -relativeNormalSpeed);
+  const rawImpulse = impactSpeed > 0
+    ? ((1 + clamp01(restitution)) * impactSpeed) / inverseMassTotal
+    : 0;
+  const maximumImpulse = maxVelocityChange / Math.max(
+    inverseLocalMass,
+    inverseRemoteMass,
+  );
+  const impulse = Math.min(rawImpulse, maximumImpulse);
+  const localVelocityChange = impulse * inverseLocalMass;
+  const remoteVelocityChange = impulse * inverseRemoteMass;
+
+  const overlap = minimumDistance - distance;
+  const correction = Math.min(0.09, Math.max(0, overlap - 0.006) * 0.56);
+  const localCorrection = correction * (inverseLocalMass / inverseMassTotal);
+  const remoteCorrection = correction * (inverseRemoteMass / inverseMassTotal);
+
+  return {
+    normalX,
+    normalZ,
+    overlap,
+    localPositionX: local.x + normalX * localCorrection,
+    localPositionZ: local.z + normalZ * localCorrection,
+    remotePositionX: remote.x - normalX * remoteCorrection,
+    remotePositionZ: remote.z - normalZ * remoteCorrection,
+    localVelocityX: local.velocityX + normalX * localVelocityChange,
+    localVelocityZ: local.velocityZ + normalZ * localVelocityChange,
+    remoteVelocityX: remote.velocityX - normalX * remoteVelocityChange,
+    remoteVelocityZ: remote.velocityZ - normalZ * remoteVelocityChange,
+    impactSpeed,
+  };
 }
 
 export function chargeToLaunch(charge: number) {

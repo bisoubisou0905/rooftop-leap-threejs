@@ -7,18 +7,36 @@ import {
   dragDistanceToCharge,
   footSweepContact,
   pointOnPlatformSurface,
+  resolveWeightedPlayerCollision,
   sweepBodyAgainstProfile,
   type FootSweepPoint,
   type PlatformSurface,
   type SideSweepContact,
   type VerticalCollisionProfile,
 } from "./game-physics";
+import type {
+  DuelCharacter,
+  DuelNetworkController,
+  DuelNetworkStatus,
+  DuelPose,
+} from "./duel-network";
 
 type GamePhase = "idle" | "charging" | "flying" | "falling" | "failed";
 type PlatformShape = "rect" | "circle" | "hex";
 type PlatformKind = "roof" | "city-light" | "signal-mast";
-type AppScreen = "home" | "game" | "settings";
+type AppScreen = "home" | "game" | "settings" | "characters";
 type BackgroundTheme = "night" | "dawn" | "violet" | "teal";
+type GameMode = "solo" | "duel";
+type CharacterType = DuelCharacter;
+
+type Hazard = {
+  step: number;
+  group: THREE.Group;
+  pivot: THREE.Group;
+  radius: number;
+  speed: number;
+  hitCooldown: number;
+};
 
 type Platform = {
   id: number;
@@ -191,18 +209,25 @@ function disposeObject(root: THREE.Object3D) {
   });
 }
 
-function createRunner(gradientMap: THREE.Texture) {
+function createRunner(
+  gradientMap: THREE.Texture,
+  character: CharacterType = "runner",
+) {
+  const isHeavy = character === "heavy";
   const runner = new THREE.Group();
+  runner.userData.character = character;
+  runner.userData.mass = isHeavy ? 1.65 : 1;
+  runner.userData.radius = isHeavy ? 0.34 : 0.28;
   const visual = new THREE.Group();
   visual.name = "runner-visual";
   runner.add(visual);
 
   const coral = new THREE.MeshToonMaterial({
-    color: 0xff5d3b,
+    color: isHeavy ? 0x276f78 : 0xff5d3b,
     gradientMap,
   });
   const coralLight = new THREE.MeshToonMaterial({
-    color: 0xff8562,
+    color: isHeavy ? 0x6eb1ad : 0xff8562,
     gradientMap,
   });
   const ink = new THREE.MeshToonMaterial({
@@ -224,25 +249,33 @@ function createRunner(gradientMap: THREE.Texture) {
   const outlinedMeshes: THREE.Mesh[] = [];
 
   const torso = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.205, 0.43, 6, 12),
+    new THREE.CapsuleGeometry(isHeavy ? 0.275 : 0.205, isHeavy ? 0.35 : 0.43, 6, 12),
     coral,
   );
-  torso.position.y = 1.0;
-  torso.scale.set(0.96, 1, 0.78);
+  torso.position.y = isHeavy ? 0.99 : 1.0;
+  torso.scale.set(isHeavy ? 1.17 : 0.96, isHeavy ? 0.96 : 1, isHeavy ? 0.84 : 0.78);
   torso.castShadow = true;
   visual.add(torso);
   outlinedMeshes.push(torso);
 
   const jacketHem = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.225, 0.205, 0.15, 10),
+    new THREE.CylinderGeometry(
+      isHeavy ? 0.29 : 0.225,
+      isHeavy ? 0.255 : 0.205,
+      isHeavy ? 0.18 : 0.15,
+      10,
+    ),
     coralLight,
   );
-  jacketHem.position.y = 0.69;
+  jacketHem.position.y = isHeavy ? 0.68 : 0.69;
   jacketHem.castShadow = true;
   visual.add(jacketHem);
   outlinedMeshes.push(jacketHem);
 
-  const hips = new THREE.Mesh(new THREE.BoxGeometry(0.31, 0.15, 0.235), ink);
+  const hips = new THREE.Mesh(
+    new THREE.BoxGeometry(isHeavy ? 0.39 : 0.31, 0.15, isHeavy ? 0.27 : 0.235),
+    ink,
+  );
   hips.position.set(0, 0.61, -0.01);
   hips.rotation.y = Math.PI / 4;
   hips.castShadow = true;
@@ -261,6 +294,7 @@ function createRunner(gradientMap: THREE.Texture) {
   hoodShell.position.set(0, -0.015, -0.03);
   hoodShell.scale.set(0.98, 1.06, 0.88);
   hoodShell.castShadow = true;
+  hoodShell.visible = !isHeavy;
   headRig.add(hoodShell);
   outlinedMeshes.push(hoodShell);
 
@@ -278,6 +312,7 @@ function createRunner(gradientMap: THREE.Texture) {
   hoodRim.position.set(0, -0.015, 0.205);
   hoodRim.rotation.z = Math.PI * 0.21;
   hoodRim.castShadow = true;
+  hoodRim.visible = !isHeavy;
   headRig.add(hoodRim);
   outlinedMeshes.push(hoodRim);
 
@@ -337,6 +372,7 @@ function createRunner(gradientMap: THREE.Texture) {
   scarf.position.set(0, 1.31, -0.21);
   scarf.rotation.x = -0.28;
   scarf.castShadow = true;
+  scarf.visible = !isHeavy;
   visual.add(scarf);
   outlinedMeshes.push(scarf);
 
@@ -348,10 +384,44 @@ function createRunner(gradientMap: THREE.Texture) {
     cord.position.set(side * 0.052, 1.265, 0.18);
     cord.rotation.z = side * -0.08;
     visual.add(cord);
+    cord.visible = !isHeavy;
     const tip = new THREE.Mesh(new THREE.SphereGeometry(0.022, 8, 6), cream);
     tip.position.set(side * 0.061, 1.175, 0.184);
     visual.add(tip);
+    tip.visible = !isHeavy;
   });
+
+  if (isHeavy) {
+    const neck = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.105, 0.13, 0.18, 10),
+      skin,
+    );
+    neck.position.y = 1.39;
+    neck.castShadow = true;
+    visual.add(neck);
+    outlinedMeshes.push(neck);
+
+    const tankRim = new THREE.Mesh(
+      new THREE.TorusGeometry(0.16, 0.026, 6, 16, Math.PI),
+      coralLight,
+    );
+    tankRim.position.set(0, 1.25, 0.22);
+    tankRim.rotation.z = Math.PI;
+    tankRim.rotation.x = -0.12;
+    visual.add(tankRim);
+    outlinedMeshes.push(tankRim);
+
+    [-1, 1].forEach((side) => {
+      const shoulder = new THREE.Mesh(
+        new THREE.SphereGeometry(0.13, 12, 9),
+        skin,
+      );
+      shoulder.position.set(side * 0.31, 1.22, 0);
+      shoulder.scale.set(1.08, 0.94, 0.92);
+      visual.add(shoulder);
+      outlinedMeshes.push(shoulder);
+    });
+  }
 
   const makeArm = (
     name: string,
@@ -360,11 +430,11 @@ function createRunner(gradientMap: THREE.Texture) {
   ) => {
     const arm = new THREE.Group();
     arm.name = name;
-    arm.position.set(side * 0.225, 1.2, 0);
+    arm.position.set(side * (isHeavy ? 0.315 : 0.225), 1.2, 0);
     arm.rotation.z = side * 0.14;
     const upperSleeve = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.052, 0.22, 5, 9),
-      coral,
+      new THREE.CapsuleGeometry(isHeavy ? 0.077 : 0.052, isHeavy ? 0.19 : 0.22, 5, 9),
+      isHeavy ? skin : coral,
     );
     upperSleeve.position.y = -0.135;
 
@@ -372,12 +442,17 @@ function createRunner(gradientMap: THREE.Texture) {
     forearm.name = forearmName;
     forearm.position.y = -0.27;
     const lowerSleeve = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.047, 0.18, 5, 9),
-      coral,
+      new THREE.CapsuleGeometry(isHeavy ? 0.062 : 0.047, isHeavy ? 0.17 : 0.18, 5, 9),
+      isHeavy ? skin : coral,
     );
     lowerSleeve.position.y = -0.115;
     const cuff = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.06, 0.052, 0.07, 8),
+      new THREE.CylinderGeometry(
+        isHeavy ? 0.07 : 0.06,
+        isHeavy ? 0.062 : 0.052,
+        0.07,
+        8,
+      ),
       coralLight,
     );
     cuff.position.y = -0.235;
@@ -401,9 +476,9 @@ function createRunner(gradientMap: THREE.Texture) {
   ) => {
     const leg = new THREE.Group();
     leg.name = name;
-    leg.position.set(side * 0.095, 0.66, 0);
+    leg.position.set(side * (isHeavy ? 0.115 : 0.095), 0.66, 0);
     const thigh = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.058, 0.22, 5, 9),
+      new THREE.CapsuleGeometry(isHeavy ? 0.072 : 0.058, 0.22, 5, 9),
       ink,
     );
     thigh.position.y = -0.13;
@@ -412,7 +487,7 @@ function createRunner(gradientMap: THREE.Texture) {
     calf.name = calfName;
     calf.position.y = -0.28;
     const shin = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.052, 0.21, 5, 9),
+      new THREE.CapsuleGeometry(isHeavy ? 0.064 : 0.052, 0.21, 5, 9),
       ink,
     );
     shin.position.y = -0.125;
@@ -461,22 +536,22 @@ function createRunner(gradientMap: THREE.Texture) {
     mesh.parent?.add(outline);
   });
 
-  const plasticShine = new THREE.MeshBasicMaterial({
-    color: 0xffd2ba,
+  const softHighlight = new THREE.MeshBasicMaterial({
+    color: isHeavy ? 0xa7d5cf : 0xffd2ba,
     transparent: true,
-    opacity: 0.48,
+    opacity: 0.3,
     depthWrite: false,
   });
   const hoodShine = new THREE.Mesh(
     new THREE.SphereGeometry(0.075, 10, 8),
-    plasticShine,
+    softHighlight,
   );
   hoodShine.position.set(-0.1, 0.055, -0.258);
   hoodShine.scale.set(0.55, 1.05, 0.14);
   headRig.add(hoodShine);
   const jacketShine = new THREE.Mesh(
     new THREE.BoxGeometry(0.036, 0.26, 0.016),
-    plasticShine,
+    softHighlight,
   );
   jacketShine.position.set(-0.13, 1.04, -0.166);
   jacketShine.rotation.z = -0.1;
@@ -812,6 +887,135 @@ function createPlatform(
   } satisfies Platform;
 }
 
+function createDuelHazard(
+  platform: Platform,
+  scene: THREE.Scene,
+  gradientMap: THREE.Texture,
+): Hazard {
+  const group = new THREE.Group();
+  group.position.set(platform.x, platform.topY, platform.z);
+  const pivot = new THREE.Group();
+  pivot.position.y = 0.24;
+  group.add(pivot);
+
+  const dark = new THREE.MeshToonMaterial({ color: 0x183348, gradientMap });
+  const warning = new THREE.MeshToonMaterial({
+    color: 0xff7755,
+    emissive: 0x8f241b,
+    emissiveIntensity: 0.18,
+    gradientMap,
+  });
+  const hub = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.095, 0.12, 0.4, 10),
+    dark,
+  );
+  hub.position.y = 0.02;
+  pivot.add(hub);
+
+  const radius = Math.min(platform.width, platform.depth) * 0.39;
+  const bar = new THREE.Mesh(
+    createRoundedBoxGeometry(radius * 2, 0.105, 0.11, 2, 0.035),
+    warning,
+  );
+  bar.position.y = 0.04;
+  pivot.add(bar);
+  [-1, 1].forEach((side) => {
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.085, 10, 8), warning);
+    cap.position.set(side * radius, 0.04, 0);
+    pivot.add(cap);
+  });
+
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.19, 0.24, 0.1, 10),
+    dark,
+  );
+  base.position.y = 0.025;
+  group.add(base);
+  scene.add(group);
+  return {
+    step: platform.step,
+    group,
+    pivot,
+    radius,
+    speed: 0.64 + (platform.step % 3) * 0.12,
+    hitCooldown: 0,
+  };
+}
+
+function addDuelFinishGate(platform: Platform, gradientMap: THREE.Texture) {
+  const gate = new THREE.Group();
+  gate.name = "duel-finish-gate";
+  const dark = new THREE.MeshToonMaterial({ color: 0x173248, gradientMap });
+  const finish = new THREE.MeshToonMaterial({
+    color: 0xff815d,
+    emissive: 0x7e231b,
+    emissiveIntensity: 0.2,
+    gradientMap,
+  });
+  const halfSpan = Math.min(platform.width * 0.38, 0.56);
+  [-1, 1].forEach((side) => {
+    const post = new THREE.Mesh(
+      createRoundedBoxGeometry(0.075, 0.78, 0.075, 2, 0.025),
+      dark,
+    );
+    post.position.set(side * halfSpan, 0.39, 0.08);
+    gate.add(post);
+  });
+  const lintel = new THREE.Mesh(
+    createRoundedBoxGeometry(halfSpan * 2 + 0.18, 0.12, 0.09, 2, 0.028),
+    finish,
+  );
+  lintel.position.set(0, 0.75, 0.08);
+  gate.add(lintel);
+  for (let index = -2; index <= 2; index += 1) {
+    const marker = new THREE.Mesh(
+      new THREE.BoxGeometry(0.045, 0.125, 0.012),
+      index % 2 === 0 ? dark : finish,
+    );
+    marker.position.set(index * halfSpan * 0.32, 0.75, 0.132);
+    marker.rotation.z = -0.35;
+    gate.add(marker);
+  }
+  platform.group.add(gate);
+}
+
+function createRisingWater(scene: THREE.Scene) {
+  const group = new THREE.Group();
+  const waterMaterial = new THREE.MeshBasicMaterial({
+    color: 0x48aebc,
+    transparent: true,
+    opacity: 0.16,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const surface = new THREE.Mesh(new THREE.PlaneGeometry(28, 84), waterMaterial);
+  surface.rotation.x = -Math.PI / 2;
+  surface.position.z = 26;
+  group.add(surface);
+
+  const lineMaterial = new THREE.MeshBasicMaterial({
+    color: 0xa4e5e6,
+    transparent: true,
+    opacity: 0.11,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const ripples: THREE.Mesh[] = [];
+  for (let index = 0; index < 7; index += 1) {
+    const ripple = new THREE.Mesh(
+      new THREE.RingGeometry(0.6, 0.67, 32),
+      lineMaterial.clone(),
+    );
+    ripple.rotation.x = -Math.PI / 2;
+    ripple.position.set((index % 3 - 1) * 3.1, 0.018, 4 + index * 6.3);
+    group.add(ripple);
+    ripples.push(ripple);
+  }
+  group.visible = false;
+  scene.add(group);
+  return { group, waterMaterial, ripples };
+}
+
 function createCity(scene: THREE.Scene) {
   const group = new THREE.Group();
   const geometry = new THREE.BoxGeometry(1, 1, 1);
@@ -1031,6 +1235,7 @@ export default function Home() {
   const restartRef = useRef<() => void>(() => undefined);
   const soundRef = useRef(true);
   const screenRef = useRef<AppScreen>("home");
+  const modeRef = useRef<GameMode>("solo");
   const [score, setScore] = useState(0);
   const [best, setBest] = useState(0);
   const [phase, setPhase] = useState<GamePhase>("idle");
@@ -1041,6 +1246,24 @@ export default function Home() {
   const [altitudeZone, setAltitudeZone] = useState("近地楼群");
   const [soundOn, setSoundOn] = useState(true);
   const [screen, setScreen] = useState<AppScreen>("home");
+  const [gameMode, setGameMode] = useState<GameMode>(() => {
+    if (typeof window === "undefined") return "solo";
+    return new URLSearchParams(window.location.search).get("mode") === "duel"
+      ? "duel"
+      : "solo";
+  });
+  const [selectedCharacter, setSelectedCharacter] = useState<CharacterType>(() => {
+    if (typeof window === "undefined") return "runner";
+    return window.localStorage.getItem("rooftop-leap-character") === "heavy"
+      ? "heavy"
+      : "runner";
+  });
+  const [duelStatus, setDuelStatus] = useState<DuelNetworkStatus | "idle">("idle");
+  const [duelCountdown, setDuelCountdown] = useState(0);
+  const [duelElapsedMs, setDuelElapsedMs] = useState(0);
+  const [duelProgress, setDuelProgress] = useState({ local: 0, remote: 0 });
+  const [duelWaterGap, setDuelWaterGap] = useState(3);
+  const [duelResult, setDuelResult] = useState("");
   const [backgroundTheme, setBackgroundTheme] =
     useState<BackgroundTheme>(() => {
       if (typeof window === "undefined") return "night";
@@ -1052,6 +1275,10 @@ export default function Home() {
     screenRef.current = screen;
   }, [screen]);
 
+  useEffect(() => {
+    modeRef.current = gameMode;
+  }, [gameMode]);
+
   const selectBackground = useCallback((theme: BackgroundTheme) => {
     setBackgroundTheme(theme);
     window.localStorage.setItem("rooftop-leap-theme", theme);
@@ -1060,6 +1287,13 @@ export default function Home() {
   const returnHome = useCallback(() => {
     restartRef.current();
     setHasJumped(false);
+    if (modeRef.current === "duel") {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("mode");
+      window.history.replaceState(null, "", url);
+      modeRef.current = "solo";
+      setGameMode("solo");
+    }
     screenRef.current = "home";
     setScreen("home");
   }, []);
@@ -1070,6 +1304,40 @@ export default function Home() {
   }, []);
 
   const closeSettings = useCallback(() => {
+    screenRef.current = "home";
+    setScreen("home");
+  }, []);
+
+  const openCharacters = useCallback(() => {
+    screenRef.current = "characters";
+    setScreen("characters");
+  }, []);
+
+  const closeCharacters = useCallback(() => {
+    screenRef.current = "home";
+    setScreen("home");
+  }, []);
+
+  const chooseCharacter = useCallback((character: CharacterType) => {
+    window.localStorage.setItem("rooftop-leap-character", character);
+    setSelectedCharacter(character);
+    screenRef.current = "home";
+    setScreen("home");
+  }, []);
+
+  const chooseMode = useCallback((mode: GameMode) => {
+    const url = new URL(window.location.href);
+    if (mode === "duel") url.searchParams.set("mode", "duel");
+    else url.searchParams.delete("mode");
+    window.history.replaceState(null, "", url);
+    modeRef.current = mode;
+    setGameMode(mode);
+    setDuelStatus(mode === "duel" ? "loading" : "idle");
+    setDuelCountdown(0);
+    setDuelElapsedMs(0);
+    setDuelProgress({ local: 0, remote: 0 });
+    setDuelWaterGap(3);
+    setDuelResult("");
     screenRef.current = "home";
     setScreen("home");
   }, []);
@@ -1121,6 +1389,26 @@ export default function Home() {
     let fallCollisionCooldown = 0;
     let fallImpactReaction = 0;
     const fallImpactNormal = new THREE.Vector2();
+    const duelFinishStep = 18;
+    let hazards: Hazard[] = [];
+    let duelNetwork: DuelNetworkController | null = null;
+    let duelConnected = false;
+    let duelRaceStartAt = Number.POSITIVE_INFINITY;
+    let duelRaceActive = false;
+    let duelFinishedAt: number | null = null;
+    let remoteFinishedAt: number | null = null;
+    let duelPenaltyMs = 0;
+    let duelWaterLevel = -3;
+    let lastDuelUiUpdate = 0;
+    let playerCollisionCooldown = 0;
+    let waterCatchCooldown = 0;
+    let remoteCharacter: CharacterType = "heavy";
+    let remoteStep = 0;
+    let remotePoseReceived = false;
+    const remoteTargetPosition = new THREE.Vector3();
+    const remoteVelocity = new THREE.Vector3();
+    let remoteRotationY = 0;
+    let remotePhase: GamePhase = "idle";
 
     setBest(bestValue);
 
@@ -1170,8 +1458,30 @@ export default function Home() {
     const cityBackdrop = createCity(scene);
     const city = cityBackdrop.group;
     const altitudeAtmosphere = createAltitudeAtmosphere(scene);
-    const runner = createRunner(toonGradient);
+    const runner = createRunner(toonGradient, selectedCharacter);
     scene.add(runner);
+    const remoteRunners = {
+      runner: createRunner(toonGradient, "runner"),
+      heavy: createRunner(toonGradient, "heavy"),
+    } satisfies Record<CharacterType, THREE.Group>;
+    Object.values(remoteRunners).forEach((remoteRunner) => {
+      remoteRunner.visible = false;
+      remoteRunner.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return;
+        const tintMaterial = (material: THREE.Material) => {
+          const clone = material.clone();
+          if ("color" in clone && clone.color instanceof THREE.Color) {
+            clone.color.lerp(new THREE.Color(0x69c6d0), 0.22);
+          }
+          return clone;
+        };
+        child.material = Array.isArray(child.material)
+          ? child.material.map(tintMaterial)
+          : tintMaterial(child.material);
+      });
+      scene.add(remoteRunner);
+    });
+    const risingWater = createRisingWater(scene);
     const contactShadowMaterial = new THREE.MeshBasicMaterial({
       color: 0x07111d,
       transparent: true,
@@ -1388,6 +1698,30 @@ export default function Home() {
       noticeTimer = window.setTimeout(() => setNotice(""), 700);
     };
 
+    const formatDuelTime = (milliseconds: number) => {
+      const seconds = Math.max(0, milliseconds) / 1000;
+      return `${Math.floor(seconds / 60)}:${(seconds % 60).toFixed(2).padStart(5, "0")}`;
+    };
+
+    const updateDuelResult = () => {
+      if (duelFinishedAt === null) {
+        if (remoteFinishedAt !== null) setDuelResult("对手已到达终点，继续追上去");
+        return;
+      }
+      if (remoteFinishedAt === null) {
+        setDuelResult(`已完成 ${formatDuelTime(duelFinishedAt)} · 等待对手`);
+        return;
+      }
+      const difference = Math.abs(duelFinishedAt - remoteFinishedAt);
+      if (difference < 35) {
+        setDuelResult(`同时抵达 · ${formatDuelTime(duelFinishedAt)}`);
+      } else if (duelFinishedAt < remoteFinishedAt) {
+        setDuelResult(`你领先 ${(difference / 1000).toFixed(2)} 秒`);
+      } else {
+        setDuelResult(`差 ${(difference / 1000).toFixed(2)} 秒 · 再来一局`);
+      }
+    };
+
     const makeRouteRow = (previousRow: Platform[], step: number) => {
       const difficulty = Math.min(step / 30, 1);
       const shapeRoll = seededNoise(step * 4.31);
@@ -1595,6 +1929,13 @@ export default function Home() {
     };
 
     const removePlatform = (platform: Platform) => {
+      hazards
+        .filter((hazard) => hazard.step === platform.step)
+        .forEach((hazard) => {
+          scene.remove(hazard.group);
+          disposeObject(hazard.group);
+        });
+      hazards = hazards.filter((hazard) => hazard.step !== platform.step);
       scene.remove(platform.group);
       disposeObject(platform.group);
       platforms = platforms.filter((item) => item !== platform);
@@ -1605,14 +1946,33 @@ export default function Home() {
       // rooftops are created in fog instead of popping into the upper frame.
       const lookAheadCount = 14;
       const lookAheadDistance = 52;
-      while (
-        generatedThroughStep < from.step + lookAheadCount ||
-        Math.max(...generatedRow.map((platform) => platform.z)) <
-          from.z + lookAheadDistance
+      while (gameMode === "duel"
+        ? generatedThroughStep < duelFinishStep
+        : generatedThroughStep < from.step + lookAheadCount ||
+          Math.max(...generatedRow.map((platform) => platform.z)) <
+            from.z + lookAheadDistance
       ) {
         const nextStep = generatedThroughStep + 1;
         const nextRow = makeRouteRow(generatedRow, nextStep);
         platforms.push(...nextRow);
+        if (
+          gameMode === "duel" &&
+          [5, 10, 15].includes(nextStep) &&
+          !hazards.some((hazard) => hazard.step === nextStep)
+        ) {
+          const hazardPlatform = [...nextRow]
+            .filter((platform) => platform.kind === "roof")
+            .sort((a, b) => b.width * b.depth - a.width * a.depth)[0];
+          if (hazardPlatform) {
+            hazards.push(createDuelHazard(hazardPlatform, scene, toonGradient));
+          }
+        }
+        if (gameMode === "duel" && nextStep === duelFinishStep) {
+          const finishPlatform = [...nextRow]
+            .filter((platform) => platform.kind === "roof")
+            .sort((a, b) => b.width * b.depth - a.width * a.depth)[0];
+          if (finishPlatform) addDuelFinishGate(finishPlatform, toonGradient);
+        }
         generatedRow = nextRow;
         generatedThroughStep = nextStep;
       }
@@ -1667,9 +2027,10 @@ export default function Home() {
       runnerVisual.rotation.set(0, 0, 0);
       runnerVisual.scale.set(1, 1, 1);
       headRig.rotation.set(0, 0, 0);
-      leftArm.position.set(-0.225, 1.2, 0);
+      const shoulderOffset = selectedCharacter === "heavy" ? 0.315 : 0.225;
+      leftArm.position.set(-shoulderOffset, 1.2, 0);
       leftArm.rotation.set(0, 0, -0.14);
-      rightArm.position.set(0.225, 1.2, 0);
+      rightArm.position.set(shoulderOffset, 1.2, 0);
       rightArm.rotation.set(0, 0, 0.14);
       leftForearm.rotation.set(0, 0, 0);
       rightForearm.rotation.set(0, 0, 0);
@@ -1727,6 +2088,11 @@ export default function Home() {
     };
 
     const resetPlatforms = () => {
+      hazards.forEach((hazard) => {
+        scene.remove(hazard.group);
+        disposeObject(hazard.group);
+      });
+      hazards = [];
       platforms.forEach((platform) => {
         scene.remove(platform.group);
         disposeObject(platform.group);
@@ -1782,6 +2148,15 @@ export default function Home() {
       fallCollisionCooldown = 0;
       fallImpactReaction = 0;
       fallImpactNormal.set(0, 0);
+      duelFinishedAt = null;
+      remoteFinishedAt = null;
+      duelPenaltyMs = 0;
+      duelRaceActive = false;
+      remoteStep = 0;
+      setDuelElapsedMs(0);
+      setDuelProgress({ local: 0, remote: 0 });
+      setDuelWaterGap(3);
+      setDuelResult("");
       chargeMaterial.opacity = 0;
       tensionLines.visible = false;
       tensionMaterial.opacity = 0;
@@ -1791,6 +2166,24 @@ export default function Home() {
     };
     restartRef.current = restart;
 
+    const respawnDuel = () => {
+      if (destroyed || gameMode !== "duel" || duelFinishedAt !== null) return;
+      runner.position.set(
+        currentPlatform.x,
+        currentPlatform.topY + RUNNER_GROUND_OFFSET,
+        currentPlatform.z,
+      );
+      runner.rotation.set(0, 0, 0);
+      runner.visible = true;
+      velocity.set(0, 0, 0);
+      settleGroundedPose();
+      captureFootFrame(previousFootFrame);
+      duelPenaltyMs += 1200;
+      waterCatchCooldown = 1.4;
+      setInternalPhase("idle");
+      flashNotice("回到上一个落点 · +1.2秒");
+    };
+
     const fail = () => {
       if (gamePhase === "failed") return;
       setInternalPhase("failed");
@@ -1799,6 +2192,9 @@ export default function Home() {
       window.localStorage.setItem("rooftop-leap-best", String(bestValue));
       playSound("fail");
       if (navigator.vibrate) navigator.vibrate([35, 40, 80]);
+      if (gameMode === "duel") {
+        window.setTimeout(respawnDuel, 760);
+      }
     };
 
     const applySideCollision = (
@@ -1829,7 +2225,7 @@ export default function Home() {
     const findSideCollision = (
       previousPosition: THREE.Vector3,
       currentPosition: THREE.Vector3,
-    ) => {
+    ): { platform: Platform; collision: SideSweepContact } | null => {
       let bestHit: { platform: Platform; collision: SideSweepContact } | null = null;
       platforms.forEach((platform) => {
         platform.collisionProfiles.forEach((profile) => {
@@ -1918,17 +2314,37 @@ export default function Home() {
 
       currentPlatform = platform;
       launchPlatformStep = platform.step;
+      if (gameMode === "duel") {
+        setDuelProgress((current) => ({ ...current, local: platform.step }));
+      }
       setInternalPhase("idle");
       ensurePathAhead(currentPlatform);
       updatePathFocus();
       captureFootFrame(previousFootFrame);
-      const landedPlatformStep = currentPlatform.step;
-      window.setTimeout(() => {
-        if (destroyed) return;
-        platforms
-          .filter((candidate) => candidate.step < landedPlatformStep)
-          .forEach(removePlatform);
-      }, 220);
+      if (
+        gameMode === "duel" &&
+        platform.step >= duelFinishStep &&
+        duelFinishedAt === null
+      ) {
+        duelFinishedAt = Math.max(
+          0,
+          performance.now() - duelRaceStartAt + duelPenaltyMs,
+        );
+        duelNetwork?.sendFinish(duelFinishedAt);
+        duelRaceActive = false;
+        setDuelElapsedMs(duelFinishedAt);
+        flashNotice("抵达终点");
+        updateDuelResult();
+      }
+      if (gameMode !== "duel") {
+        const landedPlatformStep = currentPlatform.step;
+        window.setTimeout(() => {
+          if (destroyed) return;
+          platforms
+            .filter((candidate) => candidate.step < landedPlatformStep)
+            .forEach(removePlatform);
+        }, 220);
+      }
     };
 
     const startJump = () => {
@@ -2037,7 +2453,19 @@ export default function Home() {
     };
 
     const onPointerDown = (event: PointerEvent) => {
-      if (screenRef.current === "settings" || gamePhase !== "idle") return;
+      if (
+        screenRef.current === "settings" ||
+        screenRef.current === "characters" ||
+        gamePhase !== "idle"
+      ) return;
+      if (gameMode === "duel" && (
+        !duelConnected ||
+        !duelRaceActive ||
+        duelFinishedAt !== null
+      )) {
+        flashNotice(duelConnected ? "等待倒计时" : "正在寻找对手");
+        return;
+      }
       event.preventDefault();
       if (screenRef.current === "home") {
         // The playable world is the lobby: the first drag dismisses the edge
@@ -2104,6 +2532,70 @@ export default function Home() {
       currentPlatform.z,
     );
     captureFootFrame(previousFootFrame);
+
+    if (gameMode === "duel") {
+      risingWater.group.visible = true;
+      void import("./duel-network")
+        .then(({ createDuelNetwork }) => createDuelNetwork(selectedCharacter, {
+          onStatus(status) {
+            if (destroyed) return;
+            setDuelStatus(status);
+            duelConnected = status === "connected";
+          },
+          onStart(delayMs, lane) {
+            if (destroyed) return;
+            restart();
+            runner.position.x = currentPlatform.x + lane * 0.36;
+            captureFootFrame(previousFootFrame);
+            duelConnected = true;
+            duelRaceStartAt = performance.now() + delayMs;
+            duelRaceActive = false;
+            setDuelCountdown(Math.ceil(delayMs / 1000));
+            screenRef.current = "game";
+            setScreen("game");
+          },
+          onPose(pose: DuelPose) {
+            if (destroyed) return;
+            remoteTargetPosition.fromArray(pose.position);
+            remoteVelocity.fromArray(pose.velocity);
+            remoteRotationY = pose.rotationY;
+            remotePhase = pose.phase;
+            remoteStep = clamp(Math.round(pose.step), 0, duelFinishStep);
+            remoteCharacter = pose.character;
+            remotePoseReceived = true;
+            setDuelProgress((current) => ({ ...current, remote: remoteStep }));
+          },
+          onBump(nextVelocity) {
+            if (destroyed || duelFinishedAt !== null) return;
+            const received = new THREE.Vector3().fromArray(nextVelocity);
+            const capped = Math.min(0.54, received.length());
+            if (received.lengthSq() > 0.0001) received.setLength(capped);
+            if (gamePhase === "flying" || gamePhase === "falling") {
+              velocity.add(received);
+            } else {
+              runner.position.addScaledVector(received, 0.07);
+            }
+            cameraKick = Math.max(cameraKick, 0.08);
+          },
+          onFinish(elapsedMs) {
+            if (destroyed) return;
+            remoteFinishedAt = elapsedMs;
+            updateDuelResult();
+          },
+          onRemoteCharacter(character) {
+            remoteCharacter = character;
+          },
+        }))
+        .then((controller) => {
+          if (destroyed) controller.destroy();
+          else duelNetwork = controller;
+        })
+        .catch(() => {
+          if (!destroyed) setDuelStatus("error");
+        });
+    } else {
+      risingWater.group.visible = false;
+    }
 
     const clock = new THREE.Clock();
     let animationFrame = 0;
@@ -2293,6 +2785,190 @@ export default function Home() {
         scarf.rotation.y *= Math.exp(-dt * 10);
       }
 
+      if (gameMode === "duel") {
+        const now = performance.now();
+        playerCollisionCooldown = Math.max(0, playerCollisionCooldown - dt);
+        waterCatchCooldown = Math.max(0, waterCatchCooldown - dt);
+
+        if (
+          duelConnected &&
+          !duelRaceActive &&
+          duelFinishedAt === null &&
+          Number.isFinite(duelRaceStartAt)
+        ) {
+          const remaining = duelRaceStartAt - now;
+          if (remaining <= 0) {
+            duelRaceActive = true;
+            setDuelCountdown(0);
+            flashNotice("开始");
+          } else {
+            setDuelCountdown(Math.ceil(remaining / 1000));
+          }
+        }
+
+        const raceElapsed = Number.isFinite(duelRaceStartAt)
+          ? Math.max(0, now - duelRaceStartAt + duelPenaltyMs)
+          : 0;
+        if (now - lastDuelUiUpdate > 100) {
+          lastDuelUiUpdate = now;
+          if (duelFinishedAt === null) setDuelElapsedMs(raceElapsed);
+          setDuelWaterGap(Math.max(0, currentPlatform.topY - duelWaterLevel));
+        }
+
+        const waterElapsed = Math.max(0, now - duelRaceStartAt) / 1000;
+        duelWaterLevel = -3 + waterElapsed * 0.057;
+        risingWater.group.position.set(focus.x, duelWaterLevel, focus.z);
+        risingWater.waterMaterial.opacity = 0.14 + Math.sin(elapsed * 0.72) * 0.025;
+        risingWater.ripples.forEach((ripple, index) => {
+          const cycle = (elapsed * (0.18 + index * 0.007) + index * 0.13) % 1;
+          ripple.scale.setScalar(0.65 + cycle * 1.25);
+          (ripple.material as THREE.MeshBasicMaterial).opacity = (1 - cycle) * 0.12;
+        });
+
+        hazards.forEach((hazard) => {
+          hazard.hitCooldown = Math.max(0, hazard.hitCooldown - dt);
+          hazard.pivot.rotation.y += hazard.speed * dt;
+          if (
+            !duelRaceActive ||
+            duelFinishedAt !== null ||
+            gamePhase === "failed" ||
+            hazard.hitCooldown > 0
+          ) return;
+          const platform = platforms.find((candidate) => candidate.step === hazard.step);
+          if (!platform || Math.abs(runner.position.y - platform.topY) > 0.86) return;
+          const offsetX = runner.position.x - hazard.group.position.x;
+          const offsetZ = runner.position.z - hazard.group.position.z;
+          const cosine = Math.cos(hazard.pivot.rotation.y);
+          const sine = Math.sin(hazard.pivot.rotation.y);
+          const along = Math.abs(offsetX * cosine + offsetZ * sine);
+          const perpendicular = -offsetX * sine + offsetZ * cosine;
+          const bodyRadius = Number(runner.userData.radius) || 0.28;
+          if (
+            along > hazard.radius + bodyRadius * 0.35 ||
+            Math.abs(perpendicular) > bodyRadius + 0.075
+          ) return;
+          const direction = Math.sign(perpendicular) || 1;
+          const mass = Number(runner.userData.mass) || 1;
+          const push = (selectedCharacter === "heavy" ? 0.22 : 0.3) / mass;
+          const pushX = -sine * direction * push;
+          const pushZ = cosine * direction * push;
+          if (gamePhase === "flying" || gamePhase === "falling") {
+            velocity.x += pushX;
+            velocity.z += pushZ;
+          } else {
+            runner.position.x += pushX * 0.13;
+            runner.position.z += pushZ * 0.13;
+            runnerVisual.rotation.z = -pushX * 0.34;
+          }
+          hazard.hitCooldown = 0.72;
+          cameraKick = Math.max(cameraKick, 0.1);
+          flashNotice("扫杆轻碰");
+          playSound("scrape");
+        });
+
+        if (
+          duelRaceActive &&
+          duelFinishedAt === null &&
+          waterCatchCooldown <= 0 &&
+          gamePhase !== "failed" &&
+          currentPlatform.topY < duelWaterLevel + 0.08
+        ) {
+          waterCatchCooldown = 2;
+          flashNotice("水位追上来了");
+          fail();
+        }
+
+        const visibleRemote = remoteRunners[remoteCharacter];
+        Object.entries(remoteRunners).forEach(([character, remoteRunner]) => {
+          remoteRunner.visible =
+            remotePoseReceived &&
+            character === remoteCharacter &&
+            remotePhase !== "failed";
+        });
+        if (remotePoseReceived) {
+          const remoteFollow = 1 - Math.exp(-dt * 12);
+          visibleRemote.position.lerp(remoteTargetPosition, remoteFollow);
+          visibleRemote.rotation.y = THREE.MathUtils.lerp(
+            visibleRemote.rotation.y,
+            remoteRotationY,
+            remoteFollow,
+          );
+          const remoteVisual = visibleRemote.getObjectByName("runner-visual") as THREE.Group;
+          if (remoteVisual) {
+            const remoteFlail = elapsed * 12.4;
+            remoteVisual.position.y = remotePhase === "flying"
+              ? Math.sin(remoteFlail * 1.3) * 0.025
+              : (Math.sin(elapsed * 2.3) + 1) * 0.003;
+            remoteVisual.rotation.x = remotePhase === "flying"
+              ? Math.sin(remoteFlail * 0.42) * 0.12
+              : 0;
+            remoteVisual.rotation.z = remotePhase === "flying"
+              ? Math.sin(remoteFlail * 0.61) * 0.16
+              : 0;
+          }
+
+          const verticalDistance = Math.abs(runner.position.y - visibleRemote.position.y);
+          if (
+            duelRaceActive &&
+            duelFinishedAt === null &&
+            remotePhase !== "failed" &&
+            verticalDistance < 0.72 &&
+            playerCollisionCooldown <= 0
+          ) {
+            const collision = resolveWeightedPlayerCollision(
+              {
+                x: runner.position.x,
+                z: runner.position.z,
+                velocityX: velocity.x,
+                velocityZ: velocity.z,
+                radius: Number(runner.userData.radius) || 0.28,
+                mass: Number(runner.userData.mass) || 1,
+              },
+              {
+                x: visibleRemote.position.x,
+                z: visibleRemote.position.z,
+                velocityX: remoteVelocity.x,
+                velocityZ: remoteVelocity.z,
+                radius: Number(visibleRemote.userData.radius) || 0.28,
+                mass: Number(visibleRemote.userData.mass) || 1,
+              },
+            );
+            if (collision) {
+              runner.position.x = collision.localPositionX;
+              runner.position.z = collision.localPositionZ;
+              visibleRemote.position.x = collision.remotePositionX;
+              visibleRemote.position.z = collision.remotePositionZ;
+              const localDeltaX = collision.localVelocityX - velocity.x;
+              const localDeltaZ = collision.localVelocityZ - velocity.z;
+              velocity.x = collision.localVelocityX;
+              velocity.z = collision.localVelocityZ;
+              duelNetwork?.sendBump([
+                collision.remoteVelocityX - remoteVelocity.x,
+                0,
+                collision.remoteVelocityZ - remoteVelocity.z,
+              ]);
+              if (Math.hypot(localDeltaX, localDeltaZ) > 0.04) {
+                runnerVisual.rotation.z = clamp(-localDeltaX * 0.34, -0.18, 0.18);
+                cameraKick = Math.max(cameraKick, 0.07);
+              }
+              playerCollisionCooldown = 0.16;
+            }
+          }
+        }
+
+        if (duelConnected) {
+          duelNetwork?.sendPose({
+            position: runner.position.toArray() as [number, number, number],
+            velocity: velocity.toArray() as [number, number, number],
+            rotationY: runner.rotation.y,
+            phase: gamePhase,
+            step: currentPlatform.step,
+            elapsedMs: duelFinishedAt ?? raceElapsed,
+            character: selectedCharacter,
+          });
+        }
+      }
+
       if (gamePhase === "charging") {
         const pulse = 1 + Math.sin(elapsed * (5 + charge * 7)) * 0.045;
         chargeGlow.scale.set(
@@ -2460,6 +3136,7 @@ export default function Home() {
 
     return () => {
       destroyed = true;
+      duelNetwork?.destroy();
       window.cancelAnimationFrame(animationFrame);
       if (noticeTimer) window.clearTimeout(noticeTimer);
       resizeObserver.disconnect();
@@ -2478,7 +3155,23 @@ export default function Home() {
       if (audioContext) void audioContext.close();
       mount.removeChild(renderer.domElement);
     };
-  }, []);
+  }, [gameMode, selectedCharacter]);
+
+  const duelStatusLabel: Record<DuelNetworkStatus | "idle", string> = {
+    idle: "未连接",
+    loading: "载入免费联机模块",
+    hosting: "等待另一位玩家",
+    joining: "正在加入比赛",
+    connected: "已匹配，准备开始",
+    reconnecting: "连接中断，正在恢复",
+    full: "当前房间已满",
+    unsupported: "当前浏览器不支持 WebRTC",
+    error: "连接失败，请刷新重试",
+  };
+  const duelSeconds = duelElapsedMs / 1000;
+  const duelTimeLabel = `${Math.floor(duelSeconds / 60)}:${(duelSeconds % 60)
+    .toFixed(2)
+    .padStart(5, "0")}`;
 
   return (
     <main className="experience">
@@ -2509,12 +3202,18 @@ export default function Home() {
         {screen === "game" && (
           <header className="hud">
             <div className="hud-brand">
-              <span className="hud-mark">纵跃</span>
-              <span className="hud-sub">ROOFTOP RUN</span>
+              <span className="hud-mark">{gameMode === "duel" ? "双人竞速" : "纵跃"}</span>
+              <span className="hud-sub">
+                {gameMode === "duel" ? "DUEL ASCENT" : "ROOFTOP RUN"}
+              </span>
             </div>
             <div className="score-block" aria-label={`当前分数 ${score}`}>
-              <span className="score-label">进度</span>
-              <strong>{String(score).padStart(2, "0")}</strong>
+              <span className="score-label">{gameMode === "duel" ? "赛段" : "进度"}</span>
+              <strong>
+                {gameMode === "duel"
+                  ? `${String(duelProgress.local).padStart(2, "0")}/18`
+                  : String(score).padStart(2, "0")}
+              </strong>
             </div>
             <div className="hud-actions">
               <button
@@ -2541,9 +3240,66 @@ export default function Home() {
           <div className={`notice ${notice ? "notice-visible" : ""}`}>{notice}</div>
         )}
 
+        {screen === "game" && gameMode === "duel" && (
+          <div className="duel-timer" aria-label={`比赛计时 ${duelTimeLabel}`}>
+            <span>TIME</span>
+            <strong>{duelTimeLabel}</strong>
+          </div>
+        )}
+
+        {screen === "game" && gameMode === "duel" && (
+          <div className="duel-water-chip" aria-label="水面距离">
+            <span className="water-wave-icon" aria-hidden="true" />
+            <strong>{duelWaterGap < 0.65 ? "水位逼近" : `水面 ${duelWaterGap.toFixed(1)}m`}</strong>
+          </div>
+        )}
+
+        {screen === "game" && gameMode === "duel" && (
+          <div className="duel-position-rail" aria-label="双方地图位置">
+            <span className="rail-finish">终</span>
+            <span className="rail-line" />
+            <span
+              className="rail-player rail-player-local"
+              style={{ bottom: `${8 + (duelProgress.local / 18) * 78}%` }}
+              aria-label={`你在第 ${duelProgress.local} 段`}
+            >
+              你
+            </span>
+            <span
+              className="rail-player rail-player-remote"
+              style={{ bottom: `${8 + (duelProgress.remote / 18) * 78}%` }}
+              aria-label={`对手在第 ${duelProgress.remote} 段`}
+            >
+              对
+            </span>
+            <span className="rail-start">起</span>
+          </div>
+        )}
+
+        {screen === "game" && gameMode === "duel" && duelCountdown > 0 && (
+          <div className="duel-countdown" aria-live="assertive">
+            <span>比赛即将开始</span>
+            <strong>{duelCountdown}</strong>
+          </div>
+        )}
+
+        {screen === "game" && gameMode === "duel" && duelResult && (
+          <div className="duel-result" role="status">
+            <span>计时赛</span>
+            <strong>{duelResult}</strong>
+            <button type="button" onClick={returnHome}>返回主页</button>
+          </div>
+        )}
+
         {screen === "game" && (
           <div
-            className={`gesture-hint ${!hasJumped && phase === "idle" ? "hint-visible" : ""}`}
+            className={`gesture-hint ${
+              !hasJumped &&
+              phase === "idle" &&
+              (gameMode === "solo" || duelCountdown === 0)
+                ? "hint-visible"
+                : ""
+            }`}
           >
             <span className="gesture-dot" />
             <div>
@@ -2573,7 +3329,7 @@ export default function Home() {
           </div>
         )}
 
-        {screen === "game" && (
+        {screen === "game" && gameMode === "solo" && (
           <div className="best-chip">最佳 {String(best).padStart(2, "0")}</div>
         )}
 
@@ -2584,7 +3340,7 @@ export default function Home() {
           </div>
         )}
 
-        {screen === "game" && phase === "failed" && (
+        {screen === "game" && gameMode === "solo" && phase === "failed" && (
           <div className="game-over" role="dialog" aria-modal="true" aria-label="本局结束">
             <div className="game-over-card">
               <span className="game-over-kicker">落空了</span>
@@ -2605,14 +3361,18 @@ export default function Home() {
             <button
               className="lobby-square-button character-button"
               type="button"
-              disabled
-              aria-label="角色选择，即将开放"
+              onClick={openCharacters}
+              tabIndex={screen === "home" ? 0 : -1}
+              aria-label="选择角色"
             >
-              <span className="character-mini" aria-hidden="true">
+              <span
+                className={`character-mini ${selectedCharacter === "heavy" ? "character-mini-heavy" : ""}`}
+                aria-hidden="true"
+              >
                 <i />
               </span>
               <span>角色</span>
-              <small>01</small>
+              <small>{selectedCharacter === "heavy" ? "重装" : "跃者"}</small>
             </button>
             <button
               className="lobby-square-button settings-button"
@@ -2628,8 +3388,8 @@ export default function Home() {
           </div>
 
           <div className="lobby-brand" aria-label={`纵跃，最佳成绩 ${best}`}>
-            <span>ROOFTOP ASCENT</span>
-            <h2>纵跃</h2>
+            <span>{gameMode === "duel" ? "TWO PLAYER RACE" : "ROOFTOP ASCENT"}</span>
+            <h2>{gameMode === "duel" ? "双人竞速" : "纵跃"}</h2>
             <div>
               <small>最佳</small>
               <strong>{String(best).padStart(2, "0")}</strong>
@@ -2639,21 +3399,45 @@ export default function Home() {
           <div className="lobby-play-hint" aria-hidden="true">
             <span className="lobby-touch-dot" />
             <div>
-              <strong>拖动角色直接开始</strong>
-              <span>向后拉 · 松手起跳</span>
+              <strong>
+                {gameMode === "duel" ? duelStatusLabel[duelStatus] : "拖动角色直接开始"}
+              </strong>
+              <span>
+                {gameMode === "duel" ? "匹配成功后自动倒计时" : "向后拉 · 松手起跳"}
+              </span>
             </div>
           </div>
 
+          {gameMode === "duel" && (
+            <div className={`duel-lobby-status duel-status-${duelStatus}`} role="status">
+              <span className="duel-status-dot" />
+              <div>
+                <strong>{duelStatusLabel[duelStatus]}</strong>
+                <small>免费 WebRTC 点对点 · 两人自动匹配</small>
+              </div>
+            </div>
+          )}
+
           <nav className="mode-dock" aria-label="玩法选择">
-            <button className="mode-card mode-active" type="button" aria-current="page">
+            <button
+              className={`mode-card ${gameMode === "solo" ? "mode-active" : ""}`}
+              type="button"
+              aria-current={gameMode === "solo" ? "page" : undefined}
+              onClick={() => chooseMode("solo")}
+            >
               <span className="ui-icon ui-icon-ascent" aria-hidden="true" />
               <strong>攀升</strong>
               <small>单人无尽</small>
             </button>
-            <button className="mode-card" type="button" disabled>
+            <button
+              className={`mode-card ${gameMode === "duel" ? "mode-active" : ""}`}
+              type="button"
+              aria-current={gameMode === "duel" ? "page" : undefined}
+              onClick={() => chooseMode("duel")}
+            >
               <span className="ui-icon ui-icon-duel" aria-hidden="true" />
               <strong>双人</strong>
-              <small>即将开放</small>
+              <small>双人计时</small>
             </button>
             <button className="mode-card" type="button" disabled>
               <span className="ui-icon ui-icon-challenge" aria-hidden="true" />
@@ -2713,6 +3497,54 @@ export default function Home() {
                 <span />
               </button>
             </div>
+          </div>
+        )}
+
+        {screen === "characters" && (
+          <div className="character-screen" aria-label="角色选择">
+            <div className="settings-header">
+              <button className="back-button" type="button" onClick={closeCharacters}>
+                返回
+              </button>
+              <div>
+                <span>RUNNER SELECT</span>
+                <h2>选择角色</h2>
+              </div>
+            </div>
+            <div className="character-grid">
+              <button
+                className={`character-card ${selectedCharacter === "runner" ? "character-selected" : ""}`}
+                type="button"
+                onClick={() => chooseCharacter("runner")}
+              >
+                <span className="character-portrait portrait-runner" aria-hidden="true">
+                  <i className="portrait-head" />
+                  <i className="portrait-body" />
+                </span>
+                <span>
+                  <strong>跃者</strong>
+                  <small>质量 1.0 · 灵巧基准</small>
+                </span>
+              </button>
+              <button
+                className={`character-card ${selectedCharacter === "heavy" ? "character-selected" : ""}`}
+                type="button"
+                onClick={() => chooseCharacter("heavy")}
+              >
+                <span className="character-portrait portrait-heavy" aria-hidden="true">
+                  <i className="portrait-head" />
+                  <i className="portrait-body" />
+                  <i className="portrait-shoulders" />
+                </span>
+                <span>
+                  <strong>重装</strong>
+                  <small>质量 1.65 · 宽肩抗撞</small>
+                </span>
+              </button>
+            </div>
+            <p className="character-note">
+              体重只影响角色碰撞反应；跳跃曲线保持一致，避免角色强度破坏手感。
+            </p>
           </div>
         )}
 
